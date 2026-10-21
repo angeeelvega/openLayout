@@ -29,6 +29,18 @@ Launching the app does not move anything. Choose **Start tiling** in the menu ba
 
 **Profiles** store a named arrangement of apps, widths, stacks, pins, and display slots. Control-Option-\\ cycles them. The same binary accepts `openlayout profile save NAME` and `openlayout profile apply NAME`.
 
+## Install
+
+Download the latest disk image from [GitHub Releases](https://github.com/angeeelvega/openLayout/releases/latest). Open it, drag **OpenLayout** onto **Applications**, then eject the disk.
+
+The app lives in the menu bar, not the Dock. The download is not notarized, so the first launch needs a manual open: Control-click `OpenLayout` in Applications and choose **Open**. Then choose **Grant Accessibility permission** in the menu, and press **Start tiling** when you want windows to move.
+
+To build the disk image yourself:
+
+```sh
+./scripts/build-dmg.sh
+```
+
 ## Requirements
 
 - macOS 13 or later
@@ -37,14 +49,14 @@ Launching the app does not move anything. Choose **Start tiling** in the menu ba
 
 An ad-hoc signature is enough for a local build. Launch at login works for the bundled `.app`.
 
-## Build
+## Build from source
 
 ```sh
 ./scripts/build-app.sh
 open OpenLayout.app
 ```
 
-The script builds the release binary, wraps it in `OpenLayout.app`, and signs it ad hoc. `cargo test` runs the layout engine without touching the window server.
+`build-app.sh` builds the release binary, wraps it in `OpenLayout.app`, and signs it ad hoc. `cargo test` runs the layout engine without touching the window server.
 
 State is stored at `~/Library/Application Support/openLayout/state.json`.
 
