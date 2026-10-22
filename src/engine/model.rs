@@ -44,6 +44,20 @@ pub enum PinEdge {
     Right,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum VerticalAlign {
+    Top,
+    Bottom,
+    Center,
+}
+
+impl Default for VerticalAlign {
+    fn default() -> Self {
+        Self::Top
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ColumnState {
     pub id: u64,
@@ -55,6 +69,8 @@ pub struct ColumnState {
     pub pin: Option<PinEdge>,
     pub natural_heights: Vec<f64>,
     pub height_fill: f64,
+    pub vertical: VerticalAlign,
+    pub arrange_lock: bool,
 }
 
 impl ColumnState {
@@ -69,6 +85,8 @@ impl ColumnState {
             pin: None,
             natural_heights: Vec::new(),
             height_fill: 1.0,
+            vertical: VerticalAlign::Top,
+            arrange_lock: false,
         }
     }
 }

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use super::geom::{order_displays, DisplaySlice, Rect, WindowId};
 use super::model::{
-    CenterMode, ColumnMode, ColumnState, DeskMode, LayoutRequest, PinEdge, Placement, StripMetrics,
+    CenterMode, ColumnMode, ColumnState, DeskMode, LayoutRequest, PinEdge, Placement, StripMetrics, VerticalAlign,
 };
 
 pub fn layout(request: &LayoutRequest) -> HashMap<WindowId, Placement> {
@@ -245,13 +245,15 @@ fn place(
         }
     }
 
-    let mut content_x = 0.0;
-    for column in unpinned {
-        let virtual_left = content_x - scroll;
-        let virtual_center = virtual_left + column.width / 2.0;
-        let lane = lane_for(virtual_center, lanes).or(if virtual_center < 0.0 { None } else { lanes.last() });
-        if let Some(lane) = lane {
-            if lane.width > 1.0 {
+        let viewport = lanes.iter().map(|lane| lane.width).sum::<f64>().max(1.0);
+        let mut fitted: Vec<ColumnState> = unpinned.into_iter().cloned().collect();
+        fit_viewport(&mut fitted, gap, viewport, scroll);
+        let mut content_x = 0.0;
+        for column in &fitted {
+            let virtual_left = content_x - scroll;
+            let virtual_center = virtual_left + column.width / 2.0;
+            let lane = lane_for(virtual_center, lanes).or(if virtual_center < 0.0 { lanes.first() } else { lanes.last() });
+            if let Some(lane) = lane {
                 let local = virtual_left - lane.virtual_start;
                 let box_rect = Rect::new(
                     lane.cocoa_x + local,
@@ -269,15 +271,63 @@ fn place(
                     &mut placements,
                     &mut park_slot,
                 );
-            } else {
-                park_column(column, &mut placements, &mut park_slot);
             }
-        } else {
-            park_column(column, &mut placements, &mut park_slot);
+            content_x += column.width + gap;
         }
-        content_x += column.width + gap;
-    }
     placements
+}
+
+/// When the strip is resting on a column edge, grow or shrink the windows that
+/// actually fit on screen so they meet the edges instead of leaving a gap.
+fn fit_viewport(columns: &mut [ColumnState], gap: f64, viewport: f64, scroll: f64) {
+    if columns.is_empty() || viewport < 80.0 {
+        return;
+    }
+    let mut origin = 0.0;
+    let mut start = None;
+    for (index, column) in columns.iter().enumerate() {
+        if (origin - scroll).abs() <= 1.0 {
+            start = Some(index);
+            break;
+        }
+        origin += column.width + gap;
+    }
+    let Some(start) = start else {
+        return;
+    };
+    if columns.get(start).is_some_and(|column| column.arrange_lock) {
+        return;
+    }
+    let mut chosen = 0usize;
+    let mut used = 0.0;
+    for column in &columns[start..] {
+        let add = if chosen == 0 { column.width } else { gap + column.width };
+        if used + add <= viewport + 24.0 {
+            used += add;
+            chosen += 1;
+            continue;
+        }
+        let visible = viewport - used - if chosen == 0 { 0.0 } else { gap };
+        if visible > column.width * 0.55 {
+            chosen += 1;
+        }
+        break;
+    }
+    if chosen == 0 {
+        return;
+    }
+    let gaps = gap * chosen.saturating_sub(1) as f64;
+    let width_sum: f64 = columns[start..start + chosen].iter().map(|column| column.width).sum();
+    if width_sum < 40.0 {
+        return;
+    }
+    let scale = ((viewport - gaps) / width_sum).clamp(0.55, 4.0);
+    if (scale - 1.0).abs() < 0.012 {
+        return;
+    }
+    for column in &mut columns[start..start + chosen] {
+        column.width *= scale;
+    }
 }
 
 fn lane_for(virtual_x: f64, lanes: &[Lane]) -> Option<&Lane> {
@@ -319,13 +369,6 @@ fn place_column(
     }
 }
 
-fn park_column(column: &ColumnState, placements: &mut HashMap<WindowId, Placement>, park_slot: &mut usize) {
-    for id in &column.windows {
-        placements.insert(*id, parked(*park_slot, 0));
-        *park_slot += 1;
-    }
-}
-
 fn parked(slot: usize, display_id: u32) -> Placement {
     Placement {
         frame: Rect::new(-32000.0, -32000.0 - slot as f64 * 48.0, 480.0, 320.0),
@@ -346,7 +389,12 @@ fn frames_inside(
     }
     let fill = column.height_fill.clamp(0.2, 1.0);
     let box_height = (box_rect.height * fill).max(40.0);
-    let column_box = Rect::new(box_rect.x, box_rect.max_y() - box_height, box_rect.width, box_height);
+    let y = match column.vertical {
+        VerticalAlign::Bottom => box_rect.y,
+        VerticalAlign::Center => box_rect.y + (box_rect.height - box_height) / 2.0,
+        VerticalAlign::Top => box_rect.max_y() - box_height,
+    };
+    let column_box = Rect::new(box_rect.x, y, box_rect.width, box_height);
 
     if column.mode == ColumnMode::Tabbed {
         let index = column.active_index.min(column.windows.len() - 1);
@@ -355,15 +403,15 @@ fn frames_inside(
             .iter()
             .enumerate()
             .map(|(offset, id)| {
-                if offset == index {
-                    (
-                        *id,
-                        single_frame(column_box, natural_height(column, offset), keep_original_height),
-                        false,
-                    )
-                } else {
-                    (*id, column_box, true)
-                }
+                (
+                    *id,
+                    if offset == index {
+                        single_frame(column_box, natural_height(column, offset), keep_original_height)
+                    } else {
+                        column_box
+                    },
+                    false,
+                )
             })
             .collect();
     }
@@ -436,23 +484,38 @@ fn normalized(raw: &[f64], count: usize) -> Vec<f64> {
 }
 
 fn fit(rect: Rect, display: &DisplaySlice, others: &[DisplaySlice]) -> Option<(Rect, bool)> {
-    if rect.intersection(display.frame).is_none() {
+    if rect.width < 12.0 || rect.height < 12.0 {
         return None;
     }
     let spills = others
         .iter()
         .any(|other| other.id != display.id && rect.intersects(other.frame));
-    if spills {
-        let cropped = rect.intersection(display.frame)?;
-        if cropped.width < 12.0 || cropped.height < 12.0 {
-            return None;
+    if !spills {
+        // Keep the window in the strip, even when it sits past the edge of this display.
+        return Some((rect, false));
+    }
+    if let Some(cropped) = rect.intersection(display.frame) {
+        if cropped.width >= 12.0 && cropped.height >= 12.0 {
+            return Some((cropped, true));
         }
-        return Some((cropped, true));
     }
-    if rect.width < 12.0 || rect.height < 12.0 {
-        return None;
+    Some((clamp_onto(rect, display), true))
+}
+
+fn clamp_onto(rect: Rect, display: &DisplaySlice) -> Rect {
+    let mut rect = rect;
+    if rect.x + rect.width * 0.5 >= display.frame.mid_x() {
+        rect.x = (display.frame.max_x() - rect.width).max(display.frame.x);
+    } else {
+        rect.x = display.frame.x;
     }
-    Some((rect, false))
+    if rect.y < display.frame.y {
+        rect.y = display.frame.y;
+    }
+    if rect.max_y() > display.frame.max_y() {
+        rect.y = (display.frame.max_y() - rect.height).max(display.frame.y);
+    }
+    rect
 }
 
 #[cfg(test)]
@@ -510,7 +573,7 @@ mod tests {
     }
 
     #[test]
-    fn offscreen_column_is_parked_instead_of_spilling() {
+    fn offscreen_column_stays_on_its_own_display() {
         let id = window(3);
         let mut columns = HashMap::new();
         columns.insert(1, vec![column(id, 700.0)]);
@@ -518,9 +581,38 @@ mod tests {
         scroll.insert(1, -1600.0);
         let placed = layout(&LayoutRequest::independent(vec![laptop(), external()], 8.0, columns, scroll));
         let frame = placed[&id];
-        assert!(frame.parked);
+        assert!(!frame.parked);
         assert!(!frame.frame.intersects(external().frame));
-        assert!(!frame.frame.intersects(laptop().frame));
+        assert!(frame.frame.intersects(laptop().frame));
+        assert!(frame.frame.y >= laptop().frame.y);
+    }
+
+    #[test]
+    fn short_columns_meet_the_screen_edges() {
+        let left = window(7);
+        let right = window(8);
+        let mut columns = HashMap::new();
+        columns.insert(1, vec![column(left, 500.0), column(right, 500.0)]);
+        let placed = layout(&LayoutRequest::independent(vec![laptop()], 8.0, columns, HashMap::new()));
+        let left_frame = placed[&left].frame;
+        let right_frame = placed[&right].frame;
+        close(left_frame.x, 8.0);
+        close(left_frame.max_x() + 8.0, right_frame.x);
+        close(right_frame.max_x(), laptop().usable.max_x());
+        close(left_frame.height, laptop().usable.height);
+    }
+
+    #[test]
+    fn a_sliver_does_not_leave_a_hole() {
+        let left = window(1);
+        let middle = window(2);
+        let extra = window(9);
+        let mut columns = HashMap::new();
+        columns.insert(1, vec![column(left, 640.0), column(middle, 640.0), column(extra, 700.0)]);
+        let placed = layout(&LayoutRequest::independent(vec![laptop()], 8.0, columns, HashMap::new()));
+        assert!(!placed[&extra].parked);
+        close(placed[&middle].frame.max_x(), laptop().usable.max_x());
+        assert!(placed[&extra].frame.x >= laptop().usable.max_x() - 1.0);
     }
 
     #[test]
@@ -567,6 +659,8 @@ mod tests {
             pin: None,
             natural_heights: Vec::new(),
             height_fill: 1.0,
+            vertical: VerticalAlign::Top,
+            arrange_lock: false,
         };
         let mut columns = HashMap::new();
         columns.insert(1, vec![stacked]);
@@ -576,6 +670,30 @@ mod tests {
         assert!(!top_frame.intersects(bottom_frame));
         close(top_frame.height + bottom_frame.height + 8.0, laptop().usable.height);
         assert!(top_frame.min_y() > bottom_frame.min_y());
+    }
+
+    #[test]
+    fn bottom_half_sits_on_the_bottom_edge() {
+        let window = window(11);
+        let mut column = column(window, 1424.0);
+        column.height_fill = 0.5;
+        column.vertical = VerticalAlign::Bottom;
+        let mut columns = HashMap::new();
+        columns.insert(1, vec![column]);
+        let placed = layout(&LayoutRequest::independent(vec![laptop()], 8.0, columns, HashMap::new()));
+        close(placed[&window].frame.min_y(), laptop().usable.min_y());
+        close(placed[&window].frame.height, laptop().usable.height / 2.0);
+    }
+
+    #[test]
+    fn a_locked_half_does_not_stretch_to_fill_the_screen() {
+        let window = window(12);
+        let mut column = column(window, 712.0);
+        column.arrange_lock = true;
+        let mut columns = HashMap::new();
+        columns.insert(1, vec![column]);
+        let placed = layout(&LayoutRequest::independent(vec![laptop()], 8.0, columns, HashMap::new()));
+        close(placed[&window].frame.width, 712.0);
     }
 
     #[test]

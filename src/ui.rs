@@ -1,12 +1,12 @@
 use crate::app::{self, with_session};
 use crate::platform::events;
-use crate::platform::objc::{activate, color, from_ns, ns_string, release, shared_app, Id, NsPoint, NsRect, NIL};
+use crate::platform::objc::{activate, color, from_ns, ns_string, release, shared_app, Id, NsPoint, NsRect, NsSize, NIL};
 use crate::session::{DeskSnapshot, IndicatorTile, Session};
 use crate::store::{self, Settings, TrackpadMode};
 use objc::declare::ClassDecl;
 use objc::runtime::{Object, Sel};
 use objc::{class, msg_send, sel, sel_impl};
-use openlayout::engine::{key_title, Action, CenterMode, DeskMode, DisplaySlice, Rect};
+use openlayout::engine::{key_title, Action, Arrange, CenterMode, DeskMode, DisplaySlice, Rect};
 use std::cell::RefCell;
 
 struct Widgets {
@@ -28,10 +28,13 @@ struct Widgets {
     action_popup: Id,
     shortcut_label: Id,
     status_label: Id,
+    access_button: Id,
+    input_button: Id,
     flags: [Id; 7],
     border_window: Id,
     indicator_window: Id,
     indicator_host: Id,
+    indicator_viewport: Id,
     indicator_signature: String,
     dim_windows: Vec<(u32, Id)>,
 }
@@ -58,7 +61,7 @@ pub fn run() {
         let _: () = msg_send![app, setDelegate: controller];
         app::install(Session::new(store::load()));
         UI.with(|cell| *cell.borrow_mut() = Some(build_widgets(controller)));
-        events::install();
+        events::install_scroll_monitor();
         let center: Id = msg_send![class!(NSDistributedNotificationCenter), defaultCenter];
         let _: () = msg_send![center, addObserver: controller
             selector: sel!(onCommand:)
@@ -66,8 +69,11 @@ pub fn run() {
             object: NIL];
         let workspace: Id = msg_send![class!(NSWorkspace), sharedWorkspace];
         let notes: Id = msg_send![workspace, notificationCenter];
+        let _: () = msg_send![notes, addObserver: controller
+            selector: sel!(activateApp:)
+            name: ns_string("NSWorkspaceDidActivateApplicationNotification")
+            object: NIL];
         for name in [
-            "NSWorkspaceDidActivateApplicationNotification",
             "NSWorkspaceDidLaunchApplicationNotification",
             "NSWorkspaceDidTerminateApplicationNotification",
             "NSWorkspaceActiveSpaceDidChangeNotification",
@@ -76,11 +82,13 @@ pub fn run() {
         ] {
             let _: () = msg_send![notes, addObserver: controller selector: sel!(tick:) name: ns_string(name) object: NIL];
         }
-        let _: Id = msg_send![class!(NSTimer), scheduledTimerWithTimeInterval: (1.0 / 60.0)
+        let timer: Id = msg_send![class!(NSTimer), timerWithTimeInterval: (1.0 / 120.0)
             target: controller
             selector: sel!(tick:)
             userInfo: NIL
             repeats: 1i8];
+        let run_loop: Id = msg_send![class!(NSRunLoop), mainRunLoop];
+        let _: () = msg_send![run_loop, addTimer: timer forMode: ns_string("NSRunLoopCommonModes")];
         sync();
         let _: () = msg_send![app, run];
         release(pool);
@@ -138,6 +146,10 @@ fn apply_model(ui: &mut Widgets, model: &Model) {
         let _: () = msg_send![ui.start_item, setTitle: ns_string(start)];
         let _: () = msg_send![ui.status_item_label, setTitle: ns_string(&model.snapshot.status)];
         let _: () = msg_send![ui.status_label, setStringValue: ns_string(&model.snapshot.status)];
+        let access = if model.snapshot.trusted { "Accessibility: Allowed" } else { "Allow Accessibility" };
+        let input = if model.snapshot.input_monitoring { "Input Monitoring: Allowed" } else { "Allow Input Monitoring" };
+        let _: () = msg_send![ui.access_button, setTitle: ns_string(access)];
+        let _: () = msg_send![ui.input_button, setTitle: ns_string(input)];
         if model.controls {
             write_controls(ui, &model.settings, &model.profiles, model.recording);
         }
@@ -243,30 +255,32 @@ fn place_indicator(ui: &mut Widgets, snapshot: &DeskSnapshot) {
         let signature = snapshot
             .indicator
             .iter()
-            .map(|tile| format!("{}:{}:{}", tile.column_id, tile.focused, tile.title))
+            .map(|tile| format!("{}:{}", tile.column_id, tile.focused))
             .collect::<Vec<_>>()
             .join("|");
         if signature != ui.indicator_signature {
             ui.indicator_signature = signature;
             rebuild_indicator(ui, &snapshot.indicator);
         }
-        let count = snapshot.indicator.len() as f64;
-        let width = (count * 132.0).clamp(180.0, 760.0);
+        place_viewport(ui, &snapshot.indicator);
+        let (width, height, _, _, _, _) = indicator_metrics(snapshot.indicator.len());
         let anchor = snapshot
-            .focus_frame
-            .and_then(|frame| display_for_point(&snapshot.displays, frame.mid_x(), frame.mid_y()))
+            .displays
+            .iter()
+            .find(|display| display.id == snapshot.indicator_display)
             .or_else(|| snapshot.displays.first());
         let Some(display) = anchor else {
             return;
         };
         let x = display.usable.x + (display.usable.width - width) / 2.0;
-        let y = display.usable.y + 12.0;
-        let _: () = msg_send![ui.indicator_window, setFrame: NsRect::new(x, y, width, 46.0) display: 1i8];
+        let y = display.usable.y + 10.0;
+        let _: () = msg_send![ui.indicator_window, setFrame: NsRect::new(x, y, width, height) display: 1i8];
+        let _: () = msg_send![ui.indicator_host, setFrame: NsRect::new(0.0, 0.0, width, height)];
         let _: () = msg_send![ui.indicator_window, orderFrontRegardless];
     }
 }
 
-fn rebuild_indicator(ui: &Widgets, tiles: &[IndicatorTile]) {
+fn rebuild_indicator(ui: &mut Widgets, tiles: &[IndicatorTile]) {
     unsafe {
         let subviews: Id = msg_send![ui.indicator_host, subviews];
         let copy: Id = msg_send![subviews, copy];
@@ -276,23 +290,93 @@ fn rebuild_indicator(ui: &Widgets, tiles: &[IndicatorTile]) {
             let _: () = msg_send![view, removeFromSuperview];
         }
         release(copy);
-        let width = if tiles.is_empty() { 120.0 } else { 120.0 };
+        let (width, height, cell_w, cell_h, gap, pad) = indicator_metrics(tiles.len());
+        let _: () = msg_send![ui.indicator_host, setFrame: NsRect::new(0.0, 0.0, width, height)];
+        let viewport: Id = msg_send![class!(NSView), alloc];
+        let viewport: Id = msg_send![viewport, initWithFrame: NsRect::new(0.0, 0.0, cell_w, cell_h)];
+        stroke_layer(viewport);
+        let _: () = msg_send![ui.indicator_host, addSubview: viewport];
+        ui.indicator_viewport = viewport;
+        let cell_y = (height - cell_h) / 2.0;
         for (index, tile) in tiles.iter().enumerate() {
-            let title = if tile.title.chars().count() > 16 {
-                format!("{}…", tile.title.chars().take(15).collect::<String>())
-            } else {
-                tile.title.clone()
-            };
-            let button: Id = msg_send![class!(NSButton), buttonWithTitle: ns_string(&title)
-                target: ui.controller
-                action: sel!(indicatorClick:)];
+            let frame = NsRect::new(pad + index as f64 * (cell_w + gap), cell_y, cell_w, cell_h);
+            let button: Id = msg_send![class!(NSButton), alloc];
+            let button: Id = msg_send![button, initWithFrame: frame];
+            let _: () = msg_send![button, setTitle: ns_string("")];
+            let _: () = msg_send![button, setBordered: 0i8];
+            let _: () = msg_send![button, setTarget: ui.controller];
+            let _: () = msg_send![button, setAction: sel!(indicatorClick:)];
             let _: () = msg_send![button, setTag: index as isize];
-            let _: () = msg_send![button, setFrame: NsRect::new(8.0 + index as f64 * (width + 8.0), 8.0, width, 30.0)];
+            let _: () = msg_send![button, setAccessibilityLabel: ns_string(&tile.title)];
             if tile.focused {
-                let _: () = msg_send![button, setBezelColor: color(0.29, 0.45, 0.95, 1.0)];
+                paint_layer(button, 0.93, 0.58, 0.24, 1.0, 4.0);
+            } else {
+                paint_layer(button, 0.62, 0.63, 0.66, 1.0, 4.0);
             }
             let _: () = msg_send![ui.indicator_host, addSubview: button];
         }
+    }
+}
+
+fn place_viewport(ui: &Widgets, tiles: &[IndicatorTile]) {
+    unsafe {
+        if ui.indicator_viewport.is_null() {
+            return;
+        }
+        let Some(frame) = viewport_frame(tiles) else {
+            let _: () = msg_send![ui.indicator_viewport, setHidden: 1i8];
+            return;
+        };
+        let _: () = msg_send![ui.indicator_viewport, setHidden: 0i8];
+        let _: () = msg_send![ui.indicator_viewport, setFrame: frame];
+    }
+}
+
+fn indicator_metrics(count: usize) -> (f64, f64, f64, f64, f64, f64) {
+    let count = count.max(1) as f64;
+    let gap = 5.0;
+    let pad = 6.0;
+    let height = 32.0;
+    let cell_h = 16.0;
+    let max_inner = 520.0 - pad * 2.0;
+    let cell_w = ((max_inner - gap * (count - 1.0)) / count).clamp(12.0, 34.0);
+    let width = pad * 2.0 + count * cell_w + (count - 1.0) * gap;
+    (width, height, cell_w, cell_h, gap, pad)
+}
+
+fn viewport_frame(tiles: &[IndicatorTile]) -> Option<NsRect> {
+    let first = tiles.iter().position(|tile| tile.on_screen)?;
+    let last = tiles.iter().rposition(|tile| tile.on_screen).unwrap_or(first);
+    let (_, height, cell_w, cell_h, gap, pad) = indicator_metrics(tiles.len());
+    let x = pad + first as f64 * (cell_w + gap) - 3.0;
+    let y = (height - cell_h) / 2.0 - 3.0;
+    let width = (last - first) as f64 * (cell_w + gap) + cell_w + 6.0;
+    Some(NsRect::new(x.max(2.0), y.max(2.0), width, cell_h + 6.0))
+}
+
+fn paint_layer(view: Id, red: f64, green: f64, blue: f64, alpha: f64, radius: f64) {
+    unsafe {
+        let _: () = msg_send![view, setWantsLayer: 1i8];
+        let layer: Id = msg_send![view, layer];
+        let ink = color(red, green, blue, alpha);
+        let cg: Id = msg_send![ink, CGColor];
+        let _: () = msg_send![layer, setBackgroundColor: cg];
+        let _: () = msg_send![layer, setCornerRadius: radius];
+    }
+}
+
+fn stroke_layer(view: Id) {
+    unsafe {
+        let _: () = msg_send![view, setWantsLayer: 1i8];
+        let layer: Id = msg_send![view, layer];
+        let clear: Id = msg_send![class!(NSColor), clearColor];
+        let clear_cg: Id = msg_send![clear, CGColor];
+        let ink = color(1.0, 1.0, 1.0, 0.96);
+        let cg: Id = msg_send![ink, CGColor];
+        let _: () = msg_send![layer, setBackgroundColor: clear_cg];
+        let _: () = msg_send![layer, setBorderColor: cg];
+        let _: () = msg_send![layer, setBorderWidth: 2.0f64];
+        let _: () = msg_send![layer, setCornerRadius: 6.0f64];
     }
 }
 
@@ -452,6 +536,7 @@ fn build_widgets(controller: Id) -> Widgets {
         let _: () = msg_send![status_item_label, setEnabled: 0i8];
         let start_item = menu_item(menu, "Start tiling", sel!(startStop:), controller);
         menu_item(menu, "All displays", sel!(openOverview:), controller);
+        add_arrange_menu(menu, controller);
         menu_item(menu, "Settings…", sel!(openSettings:), controller);
         let separator: Id = msg_send![class!(NSMenuItem), separatorItem];
         let _: () = msg_send![menu, addItem: separator];
@@ -481,12 +566,13 @@ fn build_widgets(controller: Id) -> Widgets {
 
         let border_window = borderless_window(NsRect::new(0.0, 0.0, 100.0, 100.0), true);
         style_border(border_window);
-        let indicator_window = borderless_window(NsRect::new(0.0, 0.0, 320.0, 46.0), false);
+        let indicator_window = borderless_window(NsRect::new(0.0, 0.0, 320.0, 32.0), false);
         let indicator_host: Id = msg_send![class!(OLFlippedView), alloc];
-        let indicator_host: Id = msg_send![indicator_host, initWithFrame: NsRect::new(0.0, 0.0, 320.0, 46.0)];
+        let indicator_host: Id = msg_send![indicator_host, initWithFrame: NsRect::new(0.0, 0.0, 320.0, 32.0)];
         let _: () = msg_send![indicator_window, setContentView: indicator_host];
-        let background = color(0.12, 0.13, 0.16, 0.94);
-        let _: () = msg_send![indicator_window, setBackgroundColor: background];
+        paint_layer(indicator_host, 0.30, 0.30, 0.32, 0.94, 8.0);
+        let clear: Id = msg_send![class!(NSColor), clearColor];
+        let _: () = msg_send![indicator_window, setBackgroundColor: clear];
 
         Widgets {
             controller,
@@ -507,10 +593,13 @@ fn build_widgets(controller: Id) -> Widgets {
             action_popup: controls.action_popup,
             shortcut_label: controls.shortcut_label,
             status_label: controls.status_label,
+            access_button: controls.access_button,
+            input_button: controls.input_button,
             flags: controls.flags,
             border_window,
             indicator_window,
             indicator_host,
+            indicator_viewport: NIL,
             indicator_signature: String::new(),
             dim_windows: Vec::new(),
         }
@@ -530,57 +619,88 @@ struct Controls {
     action_popup: Id,
     shortcut_label: Id,
     status_label: Id,
+    access_button: Id,
+    input_button: Id,
     flags: [Id; 7],
 }
 
 fn settings_form(controller: Id) -> (Id, Controls) {
     unsafe {
         let document: Id = msg_send![class!(OLFlippedView), alloc];
-        let document: Id = msg_send![document, initWithFrame: NsRect::new(0.0, 0.0, 660.0, 1180.0)];
-        let mut y = 18.0;
-        add_label(document, "openLayout keeps every window on a sideways strip. Each display has its own strip, and Unified desk scrolls them as one workspace.", 20.0, y, 620.0);
-        y += 48.0;
-        let status_label = add_label(document, "Checking Accessibility…", 20.0, y, 620.0);
-        y += 36.0;
-        add_button(document, "Grant Accessibility permission", controller, sel!(grantAccess:), 20.0, y, 280.0);
-        y += 42.0;
-        let gap = labeled_slider(document, "Gap between windows", controller, sel!(gapChanged:), 0.0, 48.0, 20.0, &mut y);
-        let outer = labeled_slider(document, "Outer margin", controller, sel!(outerChanged:), 0.0, 64.0, 20.0, &mut y);
-        let width = labeled_slider(document, "Default width (%)", controller, sel!(widthChanged:), 20.0, 100.0, 20.0, &mut y);
-        let mode = labeled_popup(document, "Desk mode", controller, sel!(modeChanged:), &["Independent strips", "Unified desk"], 20.0, &mut y);
-        let center = labeled_popup(document, "Keep the focused column centered", controller, sel!(centerChanged:), &["Never", "When the strip overflows", "Always"], 20.0, &mut y);
-        let trackpad = labeled_popup(document, "Trackpad", controller, sel!(trackpadChanged:), &["Off", "Control-Option plus horizontal scroll", "Any horizontal scroll"], 20.0, &mut y);
-        add_label(document, "Width presets, as percentages", 20.0, y, 620.0);
-        y += 24.0;
-        let presets = text_field(document, controller, sel!(presetsChanged:), 20.0, y, 420.0);
-        y += 40.0;
-        let flags = [
-            checkbox(document, "Keep the height a window opened with", controller, 1, 20.0, &mut y),
-            checkbox(document, "Focus border", controller, 2, 20.0, &mut y),
-            checkbox(document, "Dim windows that are not focused", controller, 3, 20.0, &mut y),
-            checkbox(document, "Focus follows the pointer", controller, 4, 20.0, &mut y),
-            checkbox(document, "Pointer follows focus", controller, 5, 20.0, &mut y),
-            checkbox(document, "Scroll every display together", controller, 6, 20.0, &mut y),
-            checkbox(document, "Open at login", controller, 7, 20.0, &mut y),
-        ];
-        y += 8.0;
-        add_label(document, "Profiles save the whole desk, including every display.", 20.0, y, 620.0);
-        y += 26.0;
-        let profile_name = text_field(document, controller, sel!(saveProfile:), 20.0, y, 240.0);
-        add_button(document, "Save profile", controller, sel!(saveProfile:), 272.0, y - 2.0, 140.0);
-        y += 36.0;
-        let profile_popup = popup(document, controller, sel!(applyProfile:), &["No profiles yet"], 20.0, y, 280.0);
-        add_button(document, "Apply", controller, sel!(applyProfile:), 312.0, y, 100.0);
-        y += 46.0;
-        add_label(document, "Shortcuts use Control-Option. Arrows and H J K L both move focus. Shift moves the window. S focuses the next display. O opens this desk. Record replaces the shortcuts for one action.", 20.0, y, 620.0);
-        y += 58.0;
-        let titles = action_titles();
-        let title_refs: Vec<&str> = titles.iter().map(String::as_str).collect();
-        let action_popup = popup(document, controller, sel!(recordShortcut:), &title_refs, 20.0, y, 280.0);
-        add_button(document, "Record", controller, sel!(recordShortcut:), 312.0, y, 100.0);
-        add_button(document, "Reset", controller, sel!(resetShortcuts:), 420.0, y, 100.0);
-        y += 36.0;
-        let shortcut_label = add_label(document, "Choose an action and click Record.", 20.0, y, 620.0);
+        let document: Id = msg_send![document, initWithFrame: NsRect::new(0.0, 0.0, 680.0, 1400.0)];
+        let _: () = msg_send![document, setWantsLayer: 1i8];
+        let layer: Id = msg_send![document, layer];
+        let background: Id = msg_send![class!(NSColor), windowBackgroundColor];
+        let background_cg: Id = msg_send![background, CGColor];
+        let _: () = msg_send![layer, setBackgroundColor: background_cg];
+
+        let mut y = 20.0;
+        let (status_label, access_button, input_button) = section(document, &mut y, |y| {
+            add_heading(document, "openLayout", 32.0, y, 600.0);
+            add_hint(document, "Each screen keeps its own strip. Pausing or quitting saves that arrangement, and a screen you unplug keeps its windows until you plug it back in.", 32.0, y, 600.0, 36.0);
+            let status = add_label(document, "Checking permissions…", 32.0, *y, 600.0);
+            *y += 28.0;
+            let access_button = add_button(document, "Allow Accessibility", controller, sel!(grantAccess:), 32.0, *y, 250.0);
+            let input_button = add_button(document, "Allow Input Monitoring", controller, sel!(grantInput:), 294.0, *y, 250.0);
+            *y += 36.0;
+            (status, access_button, input_button)
+        });
+        let (gap, outer, width, presets) = section(document, &mut y, |y| {
+            add_heading(document, "Layout", 32.0, y, 600.0);
+            add_hint(document, "Space around the windows on every screen.", 32.0, y, 600.0, 18.0);
+            let gap = labeled_slider(document, "Gap between windows", controller, sel!(gapChanged:), 0.0, 48.0, 32.0, y);
+            let outer = labeled_slider(document, "Outer margin", controller, sel!(outerChanged:), 0.0, 64.0, 32.0, y);
+            let width = labeled_slider(document, "Default width for a new window", controller, sel!(widthChanged:), 20.0, 100.0, 32.0, y);
+            add_label(document, "Width presets, as percentages", 32.0, *y, 600.0);
+            *y += 22.0;
+            let presets = text_field(document, controller, sel!(presetsChanged:), 32.0, *y, 360.0);
+            *y += 36.0;
+            (gap, outer, width, presets)
+        });
+        let (mode, center, trackpad, linked) = section(document, &mut y, |y| {
+            add_heading(document, "Screens", 32.0, y, 600.0);
+            add_hint(document, "Hold Control and Option, then scroll up, down, or sideways. The strip under the pointer moves with your fingers.", 32.0, y, 600.0, 32.0);
+            let mode = labeled_popup(document, "Desk", controller, sel!(modeChanged:), &["Each screen on its own", "One desk across every screen"], 32.0, y);
+            let center = labeled_popup(document, "Focused window", controller, sel!(centerChanged:), &["Leave it where it is", "Center it when the strip overflows", "Always center it"], 32.0, y);
+            let trackpad = labeled_popup(document, "Trackpad", controller, sel!(trackpadChanged:), &["Off", "Control-Option and scroll", "Any horizontal scroll"], 32.0, y);
+            let linked = checkbox(document, "Scroll every screen together", controller, 6, 32.0, y);
+            (mode, center, trackpad, linked)
+        });
+        let flags = section(document, &mut y, |y| {
+            add_heading(document, "Behavior", 32.0, y, 600.0);
+            let keep = checkbox(document, "Keep the height a window opened with", controller, 1, 32.0, y);
+            let border = checkbox(document, "Focus border", controller, 2, 32.0, y);
+            let dim = checkbox(document, "Dim windows that are not focused", controller, 3, 32.0, y);
+            let focus_mouse = checkbox(document, "Focus follows the pointer", controller, 4, 32.0, y);
+            let mouse_focus = checkbox(document, "Pointer follows focus", controller, 5, 32.0, y);
+            let login = checkbox(document, "Open at login", controller, 7, 32.0, y);
+            [keep, border, dim, focus_mouse, mouse_focus, linked, login]
+        });
+        let (profile_name, profile_popup) = section(document, &mut y, |y| {
+            add_heading(document, "Profiles", 32.0, y, 600.0);
+            add_hint(document, "A profile remembers the whole desk, one strip per screen.", 32.0, y, 600.0, 18.0);
+            let profile_name = text_field(document, controller, sel!(saveProfile:), 32.0, *y, 240.0);
+            add_button(document, "Save profile", controller, sel!(saveProfile:), 284.0, *y - 2.0, 140.0);
+            *y += 40.0;
+            let profile_popup = popup(document, controller, sel!(applyProfile:), &["No profiles yet"], 32.0, *y, 280.0);
+            add_button(document, "Apply", controller, sel!(applyProfile:), 324.0, *y, 100.0);
+            *y += 40.0;
+            (profile_name, profile_popup)
+        });
+        let (action_popup, shortcut_label) = section(document, &mut y, |y| {
+            add_heading(document, "Shortcuts", 32.0, y, 600.0);
+            add_hint(document, "Control-Option. Arrows or H J K L move focus. Shift moves the window. S focuses the next screen.", 32.0, y, 600.0, 32.0);
+            let titles = action_titles();
+            let title_refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+            let action_popup = popup(document, controller, sel!(recordShortcut:), &title_refs, 32.0, *y, 280.0);
+            add_button(document, "Record", controller, sel!(recordShortcut:), 324.0, *y, 100.0);
+            add_button(document, "Reset", controller, sel!(resetShortcuts:), 432.0, *y, 100.0);
+            *y += 36.0;
+            let shortcut_label = add_label(document, "Choose an action, then click Record.", 32.0, *y, 600.0);
+            *y += 28.0;
+            (action_popup, shortcut_label)
+        });
+        let _: () = msg_send![document, setFrame: NsRect::new(0.0, 0.0, 680.0, y + 12.0)];
         (
             document,
             Controls {
@@ -596,10 +716,64 @@ fn settings_form(controller: Id) -> (Id, Controls) {
                 action_popup,
                 shortcut_label,
                 status_label,
+                access_button,
+                input_button,
                 flags,
             },
         )
     }
+}
+
+fn section<T>(parent: Id, y: &mut f64, body: impl FnOnce(&mut f64) -> T) -> T {
+    let top = *y;
+    *y += 16.0;
+    let value = body(y);
+    *y += 12.0;
+    card_behind(parent, 16.0, top, 648.0, *y - top);
+    *y += 14.0;
+    value
+}
+
+fn card_behind(parent: Id, x: f64, y: f64, width: f64, height: f64) {
+    unsafe {
+        let card: Id = msg_send![class!(OLFlippedView), alloc];
+        let card: Id = msg_send![card, initWithFrame: NsRect::new(x, y, width, height)];
+        let _: () = msg_send![card, setWantsLayer: 1i8];
+        let layer: Id = msg_send![card, layer];
+        let fill: Id = msg_send![class!(NSColor), controlBackgroundColor];
+        let stroke: Id = msg_send![class!(NSColor), separatorColor];
+        let fill_cg: Id = msg_send![fill, CGColor];
+        let stroke_cg: Id = msg_send![stroke, CGColor];
+        let _: () = msg_send![layer, setBackgroundColor: fill_cg];
+        let _: () = msg_send![layer, setBorderColor: stroke_cg];
+        let _: () = msg_send![layer, setBorderWidth: 1.0f64];
+        let _: () = msg_send![layer, setCornerRadius: 12.0f64];
+        let _: () = msg_send![parent, addSubview: card positioned: -1isize relativeTo: NIL];
+    }
+}
+
+fn add_heading(parent: Id, text: &str, x: f64, y: &mut f64, width: f64) {
+    unsafe {
+        let label: Id = msg_send![class!(NSTextField), labelWithString: ns_string(text)];
+        let font: Id = msg_send![class!(NSFont), systemFontOfSize: 13.0f64 weight: 0.3f64];
+        let _: () = msg_send![label, setFont: font];
+        let _: () = msg_send![label, setFrame: NsRect::new(x, *y, width, 18.0)];
+        let _: () = msg_send![parent, addSubview: label];
+    }
+    *y += 24.0;
+}
+
+fn add_hint(parent: Id, text: &str, x: f64, y: &mut f64, width: f64, height: f64) {
+    unsafe {
+        let label: Id = msg_send![class!(NSTextField), labelWithString: ns_string(text)];
+        let font: Id = msg_send![class!(NSFont), systemFontOfSize: 12.0f64 weight: 0.0f64];
+        let ink: Id = msg_send![class!(NSColor), secondaryLabelColor];
+        let _: () = msg_send![label, setFont: font];
+        let _: () = msg_send![label, setTextColor: ink];
+        let _: () = msg_send![label, setFrame: NsRect::new(x, *y, width, height)];
+        let _: () = msg_send![parent, addSubview: label];
+    }
+    *y += height + 6.0;
 }
 
 fn action_titles() -> Vec<String> {
@@ -615,11 +789,12 @@ fn add_label(parent: Id, text: &str, x: f64, y: f64, width: f64) -> Id {
     }
 }
 
-fn add_button(parent: Id, title: &str, target: Id, action: Sel, x: f64, y: f64, width: f64) {
+fn add_button(parent: Id, title: &str, target: Id, action: Sel, x: f64, y: f64, width: f64) -> Id {
     unsafe {
         let button: Id = msg_send![class!(NSButton), buttonWithTitle: ns_string(title) target: target action: action];
         let _: () = msg_send![button, setFrame: NsRect::new(x, y, width, 28.0)];
         let _: () = msg_send![parent, addSubview: button];
+        button
     }
 }
 
@@ -691,6 +866,70 @@ fn menu_item(menu: Id, title: &str, action: Sel, target: Id) -> Id {
     }
 }
 
+fn add_arrange_menu(menu: Id, controller: Id) {
+    unsafe {
+        let submenu: Id = msg_send![class!(NSMenu), new];
+        let mut section = "";
+        for (index, kind) in Arrange::all().iter().copied().enumerate() {
+            if kind.section() != section {
+                if !section.is_empty() {
+                    let separator: Id = msg_send![class!(NSMenuItem), separatorItem];
+                    let _: () = msg_send![submenu, addItem: separator];
+                }
+                section = kind.section();
+                let header: Id = msg_send![class!(NSMenuItem), alloc];
+                let header: Id = msg_send![header, initWithTitle: ns_string(section) action: NIL keyEquivalent: ns_string("")];
+                let _: () = msg_send![header, setEnabled: 0i8];
+                let _: () = msg_send![submenu, addItem: header];
+            }
+            let item = menu_item(submenu, kind.title(), sel!(arrange:), controller);
+            let _: () = msg_send![item, setTag: index as isize];
+            let _: () = msg_send![item, setImage: arrange_icon(kind)];
+        }
+        let parent: Id = msg_send![class!(NSMenuItem), alloc];
+        let parent: Id = msg_send![parent, initWithTitle: ns_string("Arrange") action: NIL keyEquivalent: ns_string("")];
+        let symbol: Id = msg_send![class!(NSImage), imageWithSystemSymbolName: ns_string("rectangle.split.2x1") accessibilityDescription: ns_string("Arrange")];
+        if !symbol.is_null() {
+            let _: () = msg_send![parent, setImage: symbol];
+        }
+        let _: () = msg_send![parent, setSubmenu: submenu];
+        let _: () = msg_send![menu, addItem: parent];
+    }
+}
+
+fn arrange_icon(kind: Arrange) -> Id {
+    let width = 26.0;
+    let height = 16.0;
+    unsafe {
+        let image: Id = msg_send![class!(NSImage), alloc];
+        let image: Id = msg_send![image, initWithSize: NsSize { width, height }];
+        let _: () = msg_send![image, lockFocus];
+        let screen: Id = msg_send![class!(NSBezierPath), bezierPathWithRoundedRect: NsRect::new(0.4, 0.4, width - 0.8, height - 0.8) xRadius: 3.0 yRadius: 3.0];
+        let wash = color(0.0, 0.0, 0.0, 0.2);
+        let _: () = msg_send![wash, setFill];
+        let _: () = msg_send![screen, fill];
+        let glyphs = kind.glyphs();
+        let pad = 1.7;
+        let gap = if glyphs.len() > 1 { 1.15 } else { 0.0 };
+        let inner_w = width - pad * 2.0;
+        let inner_h = height - pad * 2.0;
+        for glyph in glyphs {
+            let cell_w = (glyph.w * inner_w - gap).max(1.2);
+            let cell_h = (glyph.h * inner_h - gap).max(1.2);
+            let x = pad + glyph.x * inner_w + gap * 0.5;
+            let y = pad + (1.0 - glyph.y - glyph.h) * inner_h + gap * 0.5;
+            let tile: Id = msg_send![class!(NSBezierPath), bezierPathWithRoundedRect: NsRect::new(x, y, cell_w, cell_h) xRadius: 1.7 yRadius: 1.7];
+            let alpha = if glyph.primary { 0.96 } else { 0.4 };
+            let ink = color(0.0, 0.0, 0.0, alpha);
+            let _: () = msg_send![ink, setFill];
+            let _: () = msg_send![tile, fill];
+        }
+        let _: () = msg_send![image, unlockFocus];
+        let _: () = msg_send![image, setTemplate: 1i8];
+        image
+    }
+}
+
 fn titled_window(title: &str, width: f64, height: f64) -> Id {
     unsafe {
         let window: Id = msg_send![class!(NSWindow), alloc];
@@ -740,11 +979,14 @@ fn register_classes() {
         let object = class!(NSObject);
         let mut controller = ClassDecl::new("OLController", object).expect("OLController");
         controller.add_method(sel!(tick:), tick as extern "C" fn(&Object, Sel, Id));
+        controller.add_method(sel!(activateApp:), activate_app as extern "C" fn(&Object, Sel, Id));
         controller.add_method(sel!(startStop:), start_stop as extern "C" fn(&Object, Sel, Id));
         controller.add_method(sel!(openSettings:), open_settings as extern "C" fn(&Object, Sel, Id));
         controller.add_method(sel!(openOverview:), open_overview as extern "C" fn(&Object, Sel, Id));
+        controller.add_method(sel!(arrange:), arrange as extern "C" fn(&Object, Sel, Id));
         controller.add_method(sel!(quit:), quit as extern "C" fn(&Object, Sel, Id));
         controller.add_method(sel!(grantAccess:), grant_access as extern "C" fn(&Object, Sel, Id));
+        controller.add_method(sel!(grantInput:), grant_input as extern "C" fn(&Object, Sel, Id));
         controller.add_method(sel!(gapChanged:), gap_changed as extern "C" fn(&Object, Sel, Id));
         controller.add_method(sel!(outerChanged:), outer_changed as extern "C" fn(&Object, Sel, Id));
         controller.add_method(sel!(widthChanged:), width_changed as extern "C" fn(&Object, Sel, Id));
@@ -800,6 +1042,35 @@ extern "C" fn tick(_: &Object, _: Sel, _: Id) {
     sync();
 }
 
+extern "C" fn activate_app(_: &Object, _: Sel, note: Id) {
+    let pid = activated_pid(note);
+    with_session(|session| {
+        if let Some(pid) = pid {
+            session.reveal_activated(pid);
+        }
+        session.tick();
+    });
+    sync();
+}
+
+fn activated_pid(note: Id) -> Option<i32> {
+    unsafe {
+        if note.is_null() {
+            return None;
+        }
+        let info: Id = msg_send![note, userInfo];
+        if info.is_null() {
+            return None;
+        }
+        let app: Id = msg_send![info, objectForKey: ns_string("NSWorkspaceApplicationKey")];
+        if app.is_null() {
+            return None;
+        }
+        let pid: i32 = msg_send![app, processIdentifier];
+        if pid <= 0 { None } else { Some(pid) }
+    }
+}
+
 extern "C" fn start_stop(_: &Object, _: Sel, _: Id) {
     with_session(|session| session.perform(Action::TogglePause));
     sync();
@@ -815,6 +1086,14 @@ extern "C" fn open_overview(_: &Object, _: Sel, _: Id) {
     sync();
 }
 
+extern "C" fn arrange(_: &Object, _: Sel, sender: Id) {
+    let tag: isize = unsafe { msg_send![sender, tag] };
+    if let Some(kind) = Arrange::from_index(tag) {
+        with_session(|session| session.arrange(kind));
+    }
+    sync();
+}
+
 extern "C" fn quit(_: &Object, _: Sel, _: Id) {
     with_session(|session| session.save());
     unsafe {
@@ -823,10 +1102,20 @@ extern "C" fn quit(_: &Object, _: Sel, _: Id) {
 }
 
 extern "C" fn grant_access(_: &Object, _: Sel, _: Id) {
-    crate::platform::ax::prompt_trust();
+    open_privacy("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility");
+}
+
+extern "C" fn grant_input(_: &Object, _: Sel, _: Id) {
+    crate::platform::ax::request_input_monitoring();
+    open_privacy("x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent");
+    with_session(|session| session.note_permissions());
+    sync();
+}
+
+fn open_privacy(url: &str) {
     unsafe {
         let workspace: Id = msg_send![class!(NSWorkspace), sharedWorkspace];
-        let url: Id = msg_send![class!(NSURL), URLWithString: ns_string("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")];
+        let url: Id = msg_send![class!(NSURL), URLWithString: ns_string(url)];
         let _: i8 = msg_send![workspace, openURL: url];
     }
 }

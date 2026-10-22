@@ -38,12 +38,16 @@ extern "C" {
     fn AXUIElementCreateApplication(pid: i32) -> CFTypeRef;
     fn AXUIElementCopyAttributeValue(element: CFTypeRef, attribute: CFTypeRef, value: *mut CFTypeRef) -> i32;
     fn AXUIElementSetAttributeValue(element: CFTypeRef, attribute: CFTypeRef, value: CFTypeRef) -> i32;
+    fn AXUIElementSetMessagingTimeout(element: CFTypeRef, timeout: f32);
     fn AXUIElementPerformAction(element: CFTypeRef, action: CFTypeRef) -> i32;
     fn AXValueCreate(kind: u32, value: *const std::ffi::c_void) -> CFTypeRef;
     fn AXValueGetValue(value: CFTypeRef, kind: u32, out: *mut std::ffi::c_void) -> bool;
     fn AXValueGetTypeID() -> usize;
     fn AXIsProcessTrusted() -> bool;
     fn AXIsProcessTrustedWithOptions(options: CFTypeRef) -> bool;
+    fn AXUIElementCreateSystemWide() -> CFTypeRef;
+    fn IOHIDCheckAccess(request_type: u32) -> u32;
+    fn IOHIDRequestAccess(request_type: u32) -> i32;
     fn _AXUIElementGetWindow(element: CFTypeRef, wid: *mut u32) -> i32;
 }
 
@@ -77,8 +81,44 @@ pub struct RawWindow {
     pub resizable: bool,
 }
 
+const LISTEN_EVENT: u32 = 1;
+
 pub fn trusted() -> bool {
     unsafe { AXIsProcessTrusted() }
+}
+
+pub fn confirm_trust() -> bool {
+    trusted() || trust_probe()
+}
+
+fn trust_probe() -> bool {
+    unsafe {
+        let system = AXUIElementCreateSystemWide();
+        if system.is_null() {
+            return false;
+        }
+        let mut value: CFTypeRef = std::ptr::null();
+        let attr = cf_string("AXFocusedApplication");
+        let status = AXUIElementCopyAttributeValue(system, attr, &mut value);
+        CFRelease(attr);
+        if !value.is_null() {
+            CFRelease(value);
+        }
+        CFRelease(system);
+        status == 0
+    }
+}
+
+const ACCESS_GRANTED: u32 = 0;
+
+pub fn input_monitoring() -> bool {
+    unsafe { IOHIDCheckAccess(LISTEN_EVENT) == ACCESS_GRANTED }
+}
+
+pub fn request_input_monitoring() {
+    unsafe {
+        let _ = IOHIDRequestAccess(LISTEN_EVENT);
+    }
 }
 
 pub fn prompt_trust() {
@@ -129,21 +169,40 @@ pub fn set_frame(element: usize, frame: Rect, primary_height: f64) {
         return;
     }
     let origin = CGPoint {
-        x: frame.x,
-        y: primary_height - frame.y - frame.height,
+        x: frame.x.round(),
+        y: (primary_height - frame.y - frame.height).round(),
     };
     let size = CGSize {
-        width: frame.width.max(40.0),
-        height: frame.height.max(40.0),
+        width: frame.width.max(40.0).round(),
+        height: frame.height.max(40.0).round(),
     };
     unsafe {
         let element = element as CFTypeRef;
+        AXUIElementSetMessagingTimeout(element, 0.008);
         if let Some(size_value) = ax_value(AX_SIZE, &size as *const CGSize as *const _) {
-            let _ = AXUIElementSetAttributeValue(element, cf_string("AXSize"), size_value);
+            let _ = AXUIElementSetAttributeValue(element, attr_size(), size_value);
             CFRelease(size_value);
         }
         if let Some(point_value) = ax_value(AX_POINT, &origin as *const CGPoint as *const _) {
-            let _ = AXUIElementSetAttributeValue(element, cf_string("AXPosition"), point_value);
+            let _ = AXUIElementSetAttributeValue(element, attr_position(), point_value);
+            CFRelease(point_value);
+        }
+    }
+}
+
+pub fn set_position(element: usize, frame: Rect, primary_height: f64) {
+    if element == 0 {
+        return;
+    }
+    let origin = CGPoint {
+        x: frame.x.round(),
+        y: (primary_height - frame.y - frame.height).round(),
+    };
+    unsafe {
+        let element = element as CFTypeRef;
+        AXUIElementSetMessagingTimeout(element, 0.008);
+        if let Some(point_value) = ax_value(AX_POINT, &origin as *const CGPoint as *const _) {
+            let _ = AXUIElementSetAttributeValue(element, attr_position(), point_value);
             CFRelease(point_value);
         }
     }
@@ -163,6 +222,43 @@ pub fn read_frame(element: usize, primary_height: f64) -> Option<Rect> {
             size.width,
             size.height,
         ))
+    }
+}
+
+pub fn deminiaturize(pid: i32) {
+    if pid <= 0 {
+        return;
+    }
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return;
+        }
+        let mut value: CFTypeRef = std::ptr::null();
+        let status = AXUIElementCopyAttributeValue(app, cf_string("AXWindows"), &mut value);
+        if status != 0 || value.is_null() {
+            CFRelease(app);
+            return;
+        }
+        let count = CFArrayGetCount(value);
+        for index in 0..count {
+            let window = CFArrayGetValueAtIndex(value, index);
+            if window.is_null() || !copy_bool(window, "AXMinimized") {
+                continue;
+            }
+            let _ = AXUIElementSetAttributeValue(window, cf_string("AXMinimized"), kCFBooleanFalse);
+        }
+        CFRelease(value);
+        CFRelease(app);
+    }
+}
+
+pub fn raise(element: usize) {
+    if element == 0 {
+        return;
+    }
+    unsafe {
+        let _ = AXUIElementPerformAction(element as CFTypeRef, cf_string("AXRaise"));
     }
 }
 
@@ -293,6 +389,21 @@ fn is_system_agent(bundle: &str) -> bool {
             | "com.apple.loginwindow"
     )
 }
+
+fn attr_size() -> CFTypeRef {
+    cached_attr(&SIZE_ATTR, "AXSize")
+}
+
+fn attr_position() -> CFTypeRef {
+    cached_attr(&POSITION_ATTR, "AXPosition")
+}
+
+fn cached_attr(slot: &std::sync::OnceLock<usize>, text: &str) -> CFTypeRef {
+    *slot.get_or_init(|| cf_string(text) as usize) as CFTypeRef
+}
+
+static SIZE_ATTR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static POSITION_ATTR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 fn cf_string(text: &str) -> CFTypeRef {
     let c = CString::new(text).unwrap_or_else(|_| CString::new("").unwrap());

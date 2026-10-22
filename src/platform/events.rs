@@ -2,12 +2,13 @@ use super::objc::{ns_string, Id, NIL};
 use crate::store::TrackpadMode;
 use objc::{class, msg_send};
 use openlayout::engine::{Action, Binding, Mod};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 #[derive(Clone, Debug)]
 pub enum BusEvent {
     Action(Action),
-    Scroll(f64),
+    Scroll { delta: f64, x: f64, y: f64 },
     Flags(bool),
     Capture(u16, u8),
     Mouse { x: f64, y: f64, kind: MouseKind },
@@ -26,6 +27,7 @@ struct HotState {
     recording: bool,
     trackpad: TrackpadMode,
     watch_mouse: bool,
+    modifier_held: bool,
     tap: usize,
 }
 
@@ -36,6 +38,7 @@ impl HotState {
             recording: false,
             trackpad: TrackpadMode::WithModifier,
             watch_mouse: false,
+            modifier_held: false,
             tap: 0,
         }
     }
@@ -46,10 +49,13 @@ static HOT: Mutex<HotState> = Mutex::new(HotState {
     recording: false,
     trackpad: TrackpadMode::WithModifier,
     watch_mouse: false,
+    modifier_held: false,
     tap: 0,
 });
 
 static QUEUE: Mutex<Vec<BusEvent>> = Mutex::new(Vec::new());
+static MONITOR_STARTED: AtomicBool = AtomicBool::new(false);
+static MONITOR: AtomicU64 = AtomicU64::new(0);
 
 const KEY_DOWN: u32 = 10;
 const KEY_UP: u32 = 11;
@@ -102,9 +108,132 @@ struct CGPoint {
     y: f64,
 }
 
-pub fn install() {
+#[repr(C)]
+struct ScrollDescriptor {
+    reserved: usize,
+    size: usize,
+    signature: *const i8,
+    layout: *const i8,
+}
+
+unsafe impl Sync for ScrollDescriptor {}
+
+#[repr(C)]
+struct ScrollBlock {
+    isa: *const u8,
+    flags: i32,
+    reserved: i32,
+    invoke: unsafe extern "C" fn(*mut ScrollBlock, Id),
+    descriptor: *const ScrollDescriptor,
+}
+
+static SCROLL_SIGNATURE: &[u8] = b"v16@?0@8\0";
+
+static SCROLL_DESCRIPTOR: ScrollDescriptor = ScrollDescriptor {
+    reserved: 0,
+    size: std::mem::size_of::<ScrollBlock>(),
+    signature: SCROLL_SIGNATURE.as_ptr().cast(),
+    layout: std::ptr::null(),
+};
+
+extern "C" {
+    static _NSConcreteGlobalBlock: u8;
+}
+
+unsafe extern "C" fn on_global_scroll(_: *mut ScrollBlock, event: Id) {
+    if event.is_null() {
+        return;
+    }
     if HOT.lock().map(|hot| hot.tap != 0).unwrap_or(false) {
         return;
+    }
+    let kind: u64 = msg_send![event, type];
+    let cg: *mut std::ffi::c_void = msg_send![event, CGEvent];
+    let (dx, dy) = if kind == 31 {
+        let dx: f64 = msg_send![event, deltaX];
+        let dy: f64 = msg_send![event, deltaY];
+        (dx * 280.0, dy * 280.0)
+    } else if !cg.is_null() {
+        raw_scroll(cg)
+    } else {
+        let precise: i8 = msg_send![event, hasPreciseScrollingDeltas];
+        let mut dx: f64 = msg_send![event, scrollingDeltaX];
+        let mut dy: f64 = msg_send![event, scrollingDeltaY];
+        if precise == 0 {
+            dx *= 16.0;
+            dy *= 16.0;
+        }
+        (dx, dy)
+    };
+    let Some(delta) = pan_delta(dx, dy, vertical_scroll_allowed()) else {
+        return;
+    };
+    let flags: u64 = msg_send![event, modifierFlags];
+    if !scroll_wanted(flags) {
+        return;
+    };
+    let (x, y) = if cg.is_null() {
+        (f64::NAN, f64::NAN)
+    } else {
+        let point = CGEventGetLocation(cg);
+        (point.x, point.y)
+    };
+    enqueue(BusEvent::Scroll { delta, x, y });
+}
+
+fn scroll_wanted(flags: u64) -> bool {
+    let Ok(hot) = HOT.lock() else {
+        return false;
+    };
+    match hot.trackpad {
+        TrackpadMode::Off => false,
+        TrackpadMode::WithModifier => (flags & CONTROL != 0 && flags & OPTION != 0) || hot.modifier_held,
+        TrackpadMode::Horizontal => true,
+    }
+}
+
+fn vertical_scroll_allowed() -> bool {
+    HOT.lock().map(|hot| hot.trackpad != TrackpadMode::Horizontal).unwrap_or(true)
+}
+
+fn raw_scroll(event: *mut std::ffi::c_void) -> (f64, f64) {
+    unsafe {
+        let mut dx = CGEventGetDoubleValueField(event, 97);
+        let mut dy = CGEventGetDoubleValueField(event, 96);
+        if dx.abs() < 0.5 && dy.abs() < 0.5 {
+            let ix = CGEventGetIntegerValueField(event, 97) as f64;
+            let iy = CGEventGetIntegerValueField(event, 96) as f64;
+            if ix.abs() >= 1.0 || iy.abs() >= 1.0 {
+                dx = ix;
+                dy = iy;
+            }
+        }
+        if dx.abs() < 0.5 && dy.abs() < 0.5 {
+            dx = CGEventGetIntegerValueField(event, 94) as f64 / 65536.0;
+            dy = CGEventGetIntegerValueField(event, 93) as f64 / 65536.0;
+        }
+        if dx.abs() < 0.5 && dy.abs() < 0.5 {
+            dx = CGEventGetIntegerValueField(event, 12) as f64 * 16.0;
+            dy = CGEventGetIntegerValueField(event, 11) as f64 * 16.0;
+        }
+        (dx, dy)
+    }
+}
+
+fn pan_delta(dx: f64, dy: f64, allow_vertical: bool) -> Option<f64> {
+    if dx.abs() >= 0.5 && dx.abs() >= dy.abs() {
+        return Some(dx);
+    }
+    if allow_vertical && dy.abs() >= 0.5 {
+        return Some(dy);
+    }
+    None
+}
+
+pub fn install() -> bool {
+    install_scroll_monitor();
+    if HOT.lock().map(|hot| hot.tap != 0).unwrap_or(false) {
+        return true;
     }
     let mask = (1u64 << KEY_DOWN)
         | (1u64 << KEY_UP)
@@ -117,13 +246,35 @@ pub fn install() {
         let tap = CGEventTapCreate(1, 0, 0, mask, tap_callback, std::ptr::null_mut());
         if tap.is_null() {
             eprintln!("openlayout: event tap unavailable until Accessibility permission is granted");
-            return;
+            return false;
         }
         let source = CFMachPortCreateRunLoopSource(std::ptr::null(), tap, 0);
         CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
         CGEventTapEnable(tap, true);
         if let Ok(mut hot) = HOT.lock() {
             hot.tap = tap as usize;
+        }
+        true
+    }
+}
+
+pub fn install_scroll_monitor() {
+    if MONITOR_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    unsafe {
+        let block = Box::leak(Box::new(ScrollBlock {
+            isa: std::ptr::addr_of!(_NSConcreteGlobalBlock),
+            flags: (1 << 28) | (1 << 30),
+            reserved: 0,
+            invoke: on_global_scroll,
+            descriptor: &SCROLL_DESCRIPTOR,
+        }));
+        let mask = (1u64 << SCROLL) | (1u64 << 31);
+        let monitor: Id = msg_send![class!(NSEvent), addGlobalMonitorForEventsMatchingMask: mask handler: block as *mut ScrollBlock];
+        if !monitor.is_null() {
+            let retained: Id = msg_send![monitor, retain];
+            MONITOR.store(retained as u64, Ordering::SeqCst);
         }
     }
 }
@@ -182,7 +333,7 @@ extern "C" fn tap_callback(
         }
         return event;
     }
-    let Ok(hot) = HOT.lock() else {
+    let Ok(mut hot) = HOT.lock() else {
         return event;
     };
     if hot.bindings.is_empty() && !hot.recording {
@@ -212,26 +363,29 @@ extern "C" fn tap_callback(
         }
         FLAGS => {
             let held = flags & CONTROL != 0 && flags & OPTION != 0;
+            hot.modifier_held = held;
             drop(hot);
             enqueue(BusEvent::Flags(held));
             return event;
         }
         SCROLL => {
-            let dx = unsafe { CGEventGetDoubleValueField(event, 97) };
-            let dy = unsafe { CGEventGetDoubleValueField(event, 96) };
-            if dx.abs() < 0.5 || dx.abs() < dy.abs() {
-                return event;
-            }
+            let allow_vertical = hot.trackpad != TrackpadMode::Horizontal;
             let consume = match hot.trackpad {
                 TrackpadMode::Off => false,
-                TrackpadMode::WithModifier => flags & CONTROL != 0 && flags & OPTION != 0,
+                TrackpadMode::WithModifier => (flags & CONTROL != 0 && flags & OPTION != 0) || hot.modifier_held,
                 TrackpadMode::Horizontal => true,
             };
-            if consume {
-                drop(hot);
-                enqueue(BusEvent::Scroll(dx));
-                return std::ptr::null_mut();
+            drop(hot);
+            if !consume {
+                return event;
             }
+            let (dx, dy) = raw_scroll(event);
+            let Some(delta) = pan_delta(dx, dy, allow_vertical) else {
+                return event;
+            };
+            let point = unsafe { CGEventGetLocation(event) };
+            enqueue(BusEvent::Scroll { delta, x: point.x, y: point.y });
+            return std::ptr::null_mut();
         }
         MOUSE_DOWN | MOUSE_UP | MOUSE_MOVED => {
             if event_type == MOUSE_MOVED && !hot.watch_mouse {

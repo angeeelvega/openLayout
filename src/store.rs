@@ -1,4 +1,4 @@
-use openlayout::engine::{Action, Binding, CenterMode, ColumnMode, DeskMode, PinEdge, Profile};
+use openlayout::engine::{Action, Binding, CenterMode, ColumnMode, DeskMode, PinEdge, Profile, VerticalAlign};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -105,7 +105,12 @@ pub struct SavedColumn {
     pub height_weights: Vec<f64>,
     pub mode: Option<ColumnMode>,
     pub pin: Option<PinEdge>,
+    #[serde(default)]
     pub height_fill: f64,
+    #[serde(default)]
+    pub vertical: VerticalAlign,
+    #[serde(default)]
+    pub arrange_lock: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -118,10 +123,12 @@ pub struct SavedDisplay {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct SavedDesk {
     pub displays: Vec<SavedDisplay>,
     pub unified: Vec<SavedColumn>,
+    /// Strips for screens that were unplugged. They come back with that screen.
+    pub offline: Vec<SavedDisplay>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

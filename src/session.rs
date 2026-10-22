@@ -1,11 +1,12 @@
 use crate::platform::ax::{self, RawWindow};
 use crate::platform::events::{BusEvent, MouseKind};
 use crate::platform::screens::{self, primary_height};
+use crate::platform::spaces;
 use crate::store::{self, AppBehavior, SavedColumn, SavedDesk, SavedDisplay, SavedState, Settings};
 use openlayout::engine::{
-    assign_profile, clamp_scroll, layout, metrics, order_displays, scroll_target, unified_metrics, Action,
-    AssignedColumn, Binding, CenterMode, ColumnMode, ColumnState, Command, DeskMode, DisplaySlice, LayoutRequest,
-    PinEdge, Placement, Profile, ProfileSlot, Rect, WindowCandidate, WindowId,
+    assign_profile, clamp_scroll, layout, metrics, order_displays, ratios, scroll_target, take_groups, unified_metrics, Action,
+    Arrange, AssignedColumn, Binding, CenterMode, ColumnMode, ColumnState, Command, DeskMode, DisplaySlice, LayoutRequest,
+    Pane, PinEdge, Placement, Profile, ProfileSlot, Rect, VerticalAlign, WindowCandidate, WindowId,
 };
 use std::collections::{HashMap, HashSet};
 use std::mem::forget;
@@ -16,6 +17,7 @@ pub struct IndicatorTile {
     pub column_id: u64,
     pub title: String,
     pub focused: bool,
+    pub on_screen: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -37,9 +39,11 @@ pub struct DeskSnapshot {
     pub focus_frame: Option<Rect>,
     pub indicator: Vec<IndicatorTile>,
     pub indicator_visible: bool,
+    pub indicator_display: u32,
     pub status: String,
     pub tiling: bool,
     pub trusted: bool,
+    pub input_monitoring: bool,
     pub window_count: usize,
 }
 
@@ -51,9 +55,11 @@ impl Default for DeskSnapshot {
             focus_frame: None,
             indicator: Vec::new(),
             indicator_visible: false,
+            indicator_display: 0,
             status: "Paused".into(),
             tiling: false,
             trusted: false,
+            input_monitoring: false,
             window_count: 0,
         }
     }
@@ -69,6 +75,8 @@ struct Column {
     pin: Option<PinEdge>,
     active_index: usize,
     height_fill: f64,
+    vertical: VerticalAlign,
+    arrange_lock: bool,
 }
 
 #[derive(Clone, Default)]
@@ -76,6 +84,12 @@ struct Strip {
     columns: Vec<Column>,
     scroll: f64,
     scroll_target: f64,
+}
+
+#[derive(Clone, Default)]
+struct SpaceDesk {
+    strips: HashMap<u32, Strip>,
+    unified: Strip,
 }
 
 struct LiveWindow {
@@ -88,6 +102,7 @@ struct LiveWindow {
     natural_height: f64,
     rigid_width: Option<f64>,
     checked_size: bool,
+    space: u64,
 }
 
 impl Drop for LiveWindow {
@@ -125,14 +140,24 @@ pub struct Session {
     frame_tick: u64,
     animating: bool,
     needs_apply: bool,
+    gesture_until: Option<Instant>,
     dirty_save: bool,
     dragging: bool,
     drag: Option<Drag>,
     modifier_held: bool,
     indicator_until: Option<Instant>,
+    shown_display: u32,
     suppress_mouse_until: Option<Instant>,
     profile_cursor: usize,
     trusted: bool,
+    input_monitoring: bool,
+    input_prompted: bool,
+    tap_ready: bool,
+    tap_attempted: bool,
+    space_id: u64,
+    space_desks: HashMap<u64, SpaceDesk>,
+    parked_screens: HashMap<u32, Strip>,
+    layout_restored: bool,
 }
 
 impl Session {
@@ -160,42 +185,92 @@ impl Session {
             frame_tick: 0,
             animating: false,
             needs_apply: false,
+            gesture_until: None,
             dirty_save: false,
             dragging: false,
             drag: None,
             modifier_held: false,
             indicator_until: None,
+            shown_display: 0,
             suppress_mouse_until: None,
             profile_cursor: 0,
             trusted: ax::trusted(),
+            input_monitoring: ax::input_monitoring(),
+            input_prompted: false,
+            tap_ready: false,
+            tap_attempted: false,
+            space_id: 0,
+            space_desks: HashMap::new(),
+            parked_screens: HashMap::new(),
+            layout_restored: false,
         };
         session.sync_hotkeys();
         session.refresh_status();
         session
     }
 
+    pub fn note_permissions(&mut self) {
+        self.trusted = ax::confirm_trust();
+        self.input_monitoring = ax::input_monitoring();
+        if self.trusted {
+            self.tap_attempted = false;
+        }
+        self.refresh_status();
+    }
+
     pub fn tick(&mut self) {
         self.frame_tick = self.frame_tick.wrapping_add(1);
-        let trusted = ax::trusted();
+        let trusted = if self.frame_tick % 20 == 0 {
+            ax::confirm_trust()
+        } else {
+            ax::trusted() || self.trusted
+        };
         if trusted != self.trusted {
             self.trusted = trusted;
             self.dirty_ui = true;
             self.dirty_controls = true;
             if trusted {
-                crate::platform::events::install();
+                self.tap_attempted = false;
             }
+            self.refresh_status();
+        }
+        let listening = ax::input_monitoring();
+        if listening != self.input_monitoring {
+            self.input_monitoring = listening;
+            self.dirty_ui = true;
+            self.refresh_status();
+        }
+        if self.trusted && !self.input_monitoring && !self.input_prompted {
+            self.input_prompted = true;
+            ax::request_input_monitoring();
+            self.input_monitoring = ax::input_monitoring();
+            self.refresh_status();
+        }
+        if self.trusted && !self.tap_ready && !self.tap_attempted {
+            self.tap_attempted = true;
+            self.tap_ready = crate::platform::events::install();
         }
         if self.animating {
             self.step_scroll();
             self.apply();
-        } else if self.needs_apply {
-            self.apply();
+        } else {
+            self.flush();
         }
-        if self.settings.tiling_enabled && !self.dragging && self.frame_tick % 15 == 0 {
-            self.reconcile();
+        if self.gesture_until.is_some_and(|until| Instant::now() >= until) {
+            self.gesture_until = None;
+            if self.settings.tiling_enabled {
+                self.publish_snapshot();
+                self.dirty_ui = true;
+            }
+        }
+        if self.settings.tiling_enabled && self.trusted && !self.dragging && !self.animating && !self.gesture_active() {
+            let active = spaces::active_space();
+            if (active != 0 && active != self.space_id) || self.frame_tick % 30 == 0 {
+                self.reconcile();
+            }
         }
         if let Some(until) = self.indicator_until {
-            if !self.modifier_held && Instant::now() > until {
+            if Instant::now() > until && !self.gesture_active() && !self.animating {
                 self.indicator_until = None;
                 self.snapshot.indicator_visible = false;
                 self.dirty_ui = true;
@@ -209,15 +284,17 @@ impl Session {
     pub fn handle_bus(&mut self, event: BusEvent) {
         match event {
             BusEvent::Action(action) => self.perform(action),
-            BusEvent::Scroll(delta) => {
+            BusEvent::Scroll { delta, x, y } => {
                 if self.settings.tiling_enabled {
-                    self.scroll_by(delta);
+                    self.scroll_by(delta, x, y);
                 }
             }
             BusEvent::Flags(held) => {
                 self.modifier_held = held;
-                if held {
-                    self.reveal_indicator();
+                if !held && !self.gesture_active() && !self.animating {
+                    self.indicator_until = None;
+                    self.snapshot.indicator_visible = false;
+                    self.dirty_ui = true;
                 }
             }
             BusEvent::Capture(code, bits) => self.capture(code, bits),
@@ -493,21 +570,30 @@ impl Session {
     }
 
     fn set_tiling(&mut self, enabled: bool) {
-        if enabled && !ax::trusted() {
-            ax::prompt_trust();
-            self.trusted = ax::trusted();
-            self.snapshot.status = "Grant Accessibility permission, then start tiling again.".into();
-            self.dirty_ui = true;
-            self.dirty_controls = true;
-            if !self.trusted {
+        if enabled {
+            if !ax::confirm_trust() {
+                self.trusted = false;
+                self.refresh_status();
+                self.dirty_controls = true;
                 return;
             }
-            crate::platform::events::install();
+            self.trusted = true;
+            self.input_monitoring = ax::input_monitoring();
+            if !self.input_monitoring {
+                ax::request_input_monitoring();
+                self.input_prompted = true;
+                self.input_monitoring = ax::input_monitoring();
+            }
+            self.tap_ready = crate::platform::events::install();
         }
         self.settings.tiling_enabled = enabled;
-        self.dirty_save = true;
         self.dirty_ui = true;
         self.dirty_controls = true;
+        if !enabled {
+            self.save();
+        } else {
+            self.dirty_save = true;
+        }
         if enabled {
             self.reconcile();
             if self.columns_empty() {
@@ -542,15 +628,30 @@ impl Session {
                 live.app_name = window.app_name;
                 self.windows.insert(id, live);
             } else if !self.should_float_raw(&window) {
-                self.insert_new(id, window);
+                if self.layout_restored {
+                    self.insert_new(id, window);
+                } else {
+                    let natural = window.frame.height;
+                    self.windows.insert(id, live_from_raw(window, false));
+                    if let Some(live) = self.windows.get_mut(&id) {
+                        live.natural_height = natural;
+                    }
+                }
             } else {
                 self.floating.insert(id);
                 self.windows.insert(id, live_from_raw(window, true));
             }
         }
+        if !self.layout_restored {
+            self.layout_restored = true;
+            if !self.saved_desk_restore() {
+                self.arrange_on_screens();
+            }
+        }
         let live_ids: HashSet<WindowId> = self.windows.keys().copied().collect();
         self.retain_live(&live_ids);
         self.rehome_missing_displays();
+        self.sync_desktops();
         if self.focused.is_some_and(|id| !live_ids.contains(&id)) {
             self.focused = None;
         }
@@ -619,39 +720,199 @@ impl Session {
             retain_strip(strip, live_ids);
         }
         retain_strip(&mut self.unified, live_ids);
+        for desk in self.space_desks.values_mut() {
+            for strip in desk.strips.values_mut() {
+                retain_strip(strip, live_ids);
+            }
+            retain_strip(&mut desk.unified, live_ids);
+        }
+        for strip in self.parked_screens.values_mut() {
+            retain_strip(strip, live_ids);
+        }
+        self.parked_screens.retain(|_, strip| !strip.columns.is_empty());
         self.floating.retain(|id| live_ids.contains(id));
+    }
+
+    fn sync_desktops(&mut self) {
+        let numbers: Vec<u32> = self.windows.keys().map(|id| id.number).collect();
+        let found = spaces::spaces_for(&numbers);
+        let active = spaces::active_space();
+        if active == 0 {
+            return;
+        }
+        for (number, space) in &found {
+            if let Some((_, window)) = self.windows.iter_mut().find(|(id, _)| id.number == *number) {
+                window.space = *space;
+            }
+        }
+        if self.space_id != active {
+            if self.space_id != 0 {
+                self.space_desks.insert(
+                    self.space_id,
+                    SpaceDesk {
+                        strips: std::mem::take(&mut self.strips),
+                        unified: std::mem::take(&mut self.unified),
+                    },
+                );
+            }
+            if let Some(desk) = self.space_desks.remove(&active) {
+                self.strips = desk.strips;
+                self.unified = desk.unified;
+            } else if self.space_id != 0 {
+                self.strips.clear();
+                self.unified = Strip::default();
+            }
+            self.space_id = active;
+            self.placements.clear();
+            self.focused = self.focused.filter(|id| self.windows.get(id).is_some_and(|window| window.space == 0 || window.space == active));
+        }
+        self.park_foreign(active);
+        self.adopt_current(active);
+        self.rehome_missing_displays();
+    }
+
+    fn park_foreign(&mut self, active: u64) {
+        let foreign: Vec<(WindowId, u64)> = self
+            .windows
+            .iter()
+            .filter(|(id, window)| !self.floating.contains(id) && window.space != 0 && window.space != active)
+            .map(|(id, window)| (*id, window.space))
+            .collect();
+        for (id, space) in foreign {
+            if self.live_contains(id) {
+                self.detach_live(id);
+            }
+            if !self.desk_contains(space, id) {
+                self.stash(space, id);
+            }
+        }
+    }
+
+    fn adopt_current(&mut self, active: u64) {
+        let missing: Vec<WindowId> = self
+            .windows
+            .keys()
+            .copied()
+            .filter(|id| {
+                !self.floating.contains(id)
+                    && self.windows.get(id).is_some_and(|window| window.space == 0 || window.space == active)
+                    && !self.live_contains(*id)
+            })
+            .collect();
+        for id in missing {
+            self.detach_desks(id);
+            let display = self
+                .windows
+                .get(&id)
+                .and_then(|window| self.display_of(window.frame))
+                .or_else(|| self.displays.first().map(|display| display.id));
+            let Some(display) = display else {
+                continue;
+            };
+            let column = self.make_column(vec![id], self.settings.default_width);
+            if self.settings.desk_mode == DeskMode::Unified {
+                self.unified.columns.push(column);
+            } else {
+                self.strips.entry(display).or_default().columns.push(column);
+            }
+        }
+    }
+
+    fn stash(&mut self, space: u64, id: WindowId) {
+        if self.desk_contains(space, id) {
+            return;
+        }
+        let display = self.windows.get(&id).and_then(|window| self.display_of(window.frame)).unwrap_or(0);
+        let column = self.make_column(vec![id], self.settings.default_width);
+        self.space_desks.entry(space).or_default().strips.entry(display).or_default().columns.push(column);
+    }
+
+    fn live_contains(&self, id: WindowId) -> bool {
+        self.strips.values().any(|strip| strip.columns.iter().any(|column| column.windows.contains(&id)))
+            || self.unified.columns.iter().any(|column| column.windows.contains(&id))
+            || self.parked_screens.values().any(|strip| strip.columns.iter().any(|column| column.windows.contains(&id)))
+    }
+
+    fn desk_contains(&self, space: u64, id: WindowId) -> bool {
+        self.space_desks.get(&space).is_some_and(|desk| {
+            desk.strips.values().any(|strip| strip.columns.iter().any(|column| column.windows.contains(&id)))
+                || desk.unified.columns.iter().any(|column| column.windows.contains(&id))
+        })
+    }
+
+    fn detach_live(&mut self, id: WindowId) {
+        for strip in self.strips.values_mut() {
+            pull_window(strip, id);
+        }
+        pull_window(&mut self.unified, id);
+    }
+
+    fn detach_desks(&mut self, id: WindowId) {
+        for desk in self.space_desks.values_mut() {
+            for strip in desk.strips.values_mut() {
+                pull_window(strip, id);
+            }
+            pull_window(&mut desk.unified, id);
+        }
     }
 
     fn rehome_missing_displays(&mut self) {
         let known: HashSet<u32> = self.displays.iter().map(|display| display.id).collect();
         let stale: Vec<u32> = self.strips.keys().copied().filter(|id| !known.contains(id)).collect();
-        let Some(fallback) = self.displays.first().map(|display| display.id) else {
-            return;
-        };
+        let mut changed = !stale.is_empty();
         for id in stale {
             if let Some(strip) = self.strips.remove(&id) {
-                self.strips.entry(fallback).or_default().columns.extend(strip.columns);
+                if !strip.columns.is_empty() {
+                    self.parked_screens.insert(id, strip);
+                }
             }
+        }
+        let returned: Vec<u32> = self
+            .parked_screens
+            .keys()
+            .copied()
+            .filter(|id| known.contains(id))
+            .collect();
+        for id in returned {
+            changed = true;
+            if let Some(strip) = self.parked_screens.remove(&id) {
+                let live = self.strips.entry(id).or_default();
+                if live.columns.is_empty() {
+                    *live = strip;
+                } else {
+                    live.columns.extend(strip.columns);
+                }
+            }
+        }
+        if changed {
+            self.save();
         }
     }
 
     fn seed_from_windows(&mut self) {
         if !self.saved_desk_restore() {
-            let ids: Vec<(WindowId, Rect)> = self
-                .windows
-                .iter()
-                .filter(|(id, _)| !self.floating.contains(id))
-                .map(|(id, window)| (*id, window.frame))
-                .collect();
-            for (id, frame) in ids {
-                let Some(display) = self.display_of(frame) else {
-                    continue;
-                };
-                let usable = self.displays.iter().find(|item| item.id == display).map(|item| item.usable.width).unwrap_or(1400.0);
-                let ratio = (frame.width / usable).clamp(0.2, 1.0);
-                let column = self.make_column(vec![id], ratio);
-                self.strips.entry(display).or_default().columns.push(column);
-            }
+            self.arrange_on_screens();
+        }
+        self.dirty_save = true;
+    }
+
+    fn arrange_on_screens(&mut self) {
+        let ids: Vec<(WindowId, Rect)> = self
+            .windows
+            .iter()
+            .filter(|(id, _)| !self.floating.contains(id) && !self.live_contains(**id))
+            .map(|(id, window)| (*id, window.frame))
+            .collect();
+        for (id, frame) in ids {
+            let Some(display) = self.display_of(frame) else {
+                continue;
+            };
+            let usable = self.displays.iter().find(|item| item.id == display).map(|item| item.usable.width).unwrap_or(1400.0);
+            let ratio = tidy_ratio((frame.width / usable).clamp(0.2, 1.0), &self.settings.presets);
+            let mut column = self.make_column(vec![id], ratio);
+            column.height_fill = 1.0;
+            self.strips.entry(display).or_default().columns.push(column);
+        }
         let order: std::collections::HashMap<u64, f64> = self
             .strips
             .values()
@@ -673,8 +934,6 @@ impl Session {
                 lx.partial_cmp(&rx).unwrap_or(std::cmp::Ordering::Equal)
             });
         }
-        }
-        self.dirty_save = true;
     }
 
     fn saved_desk_restore(&mut self) -> bool {
@@ -687,16 +946,38 @@ impl Session {
             self.unified.columns = self.claim_columns(&saved.unified, &mut pool);
         } else {
             let ordered = order_displays(self.displays.clone());
+            let mut used = HashSet::new();
             for (index, display) in ordered.iter().enumerate() {
                 let source = saved
                     .displays
                     .iter()
                     .find(|item| item.display_id == display.id)
-                    .or_else(|| saved.displays.iter().find(|item| item.index == index));
+                    .or_else(|| saved.displays.iter().find(|item| item.index == index && !used.contains(&item.display_id)));
                 if let Some(source) = source {
+                    used.insert(source.display_id);
                     let columns = self.claim_columns(&source.columns, &mut pool);
                     self.strips.insert(display.id, Strip { columns, scroll: source.scroll, scroll_target: source.scroll });
                 }
+            }
+            let pending: Vec<SavedDisplay> = saved
+                .displays
+                .iter()
+                .chain(saved.offline.iter())
+                .filter(|item| !used.contains(&item.display_id) && !self.strips.contains_key(&item.display_id))
+                .cloned()
+                .collect();
+            for source in pending {
+                let columns = self.claim_columns(&source.columns, &mut pool);
+                if columns.is_empty() {
+                    continue;
+                }
+                let strip = Strip { columns, scroll: source.scroll, scroll_target: source.scroll };
+                if self.displays.iter().any(|display| display.id == source.display_id) {
+                    self.strips.insert(source.display_id, strip);
+                } else {
+                    self.parked_screens.insert(source.display_id, strip);
+                }
+                used.insert(source.display_id);
             }
         }
         for id in pool {
@@ -737,6 +1018,8 @@ impl Session {
             column.mode = slot.mode.unwrap_or(ColumnMode::Stacked);
             column.pin = slot.pin;
             column.height_fill = if slot.height_fill <= 0.0 { 1.0 } else { slot.height_fill };
+            column.vertical = slot.vertical;
+            column.arrange_lock = slot.arrange_lock;
             columns.push(column);
         }
         columns
@@ -771,8 +1054,22 @@ impl Session {
             if previous.is_some_and(|prior| near(prior.frame, placement.frame) && prior.parked == placement.parked) {
                 continue;
             }
-            ax::set_frame(window.element, placement.frame, self.primary_height);
-            if !placement.cropped && !window.checked_size && !placement.parked {
+            let size_same = previous.is_some_and(|prior| {
+                !prior.parked
+                    && !placement.parked
+                    && (prior.frame.width - placement.frame.width).abs() < 0.75
+                    && (prior.frame.height - placement.frame.height).abs() < 0.75
+            });
+            if size_same {
+                let x = placement.frame.x;
+                let y = self.primary_height - placement.frame.y - placement.frame.height;
+                if !spaces::move_window(id.number, x, y) {
+                    ax::set_position(window.element, placement.frame, self.primary_height);
+                }
+            } else {
+                ax::set_frame(window.element, placement.frame, self.primary_height);
+            }
+            if !self.animating && !placement.cropped && !window.checked_size && !placement.parked {
                 if let Some(actual) = ax::read_frame(window.element, self.primary_height) {
                     if (actual.width - placement.frame.width).abs() > 16.0 {
                         window.rigid_width = Some(actual.width);
@@ -783,8 +1080,16 @@ impl Session {
             }
         }
         self.placements = placed;
-        self.publish_snapshot();
-        self.dirty_ui = true;
+        if !self.animating && !self.gesture_active() {
+            self.raise_front_tabs();
+            self.publish_snapshot();
+            self.dirty_ui = true;
+        } else {
+            self.refresh_indicator();
+            if self.snapshot.indicator_visible {
+                self.dirty_ui = true;
+            }
+        }
     }
 
     fn layout_request(&self) -> LayoutRequest {
@@ -841,6 +1146,8 @@ impl Session {
             pin: column.pin,
             natural_heights,
             height_fill: column.height_fill,
+            vertical: column.vertical,
+            arrange_lock: column.arrange_lock,
         }
     }
 
@@ -856,21 +1163,100 @@ impl Session {
         self.animating = moving;
     }
 
-    fn scroll_by(&mut self, delta: f64) {
+    fn scroll_by(&mut self, delta: f64, x: f64, y: f64) {
+        let advance = |current: f64| (current - delta).max(0.0);
         if self.settings.desk_mode == DeskMode::Unified {
-            let metrics = self.unified_metrics();
-            self.unified.scroll_target = clamp_scroll(self.unified.scroll_target - delta, metrics.0, metrics.1);
+            let current = self.unified.scroll;
+            follow_scroll(&mut self.unified, advance(current));
         } else if self.settings.linked_scroll {
             for strip in self.strips.values_mut() {
-                strip.scroll_target = (strip.scroll_target - delta).max(0.0);
+                follow_scroll(strip, advance(strip.scroll));
             }
-        } else if let Some(display) = self.focused_display() {
+        } else if let Some(display) = self.scroll_display(x, y) {
             if let Some(strip) = self.strips.get_mut(&display) {
-                strip.scroll_target = (strip.scroll_target - delta).max(0.0);
+                follow_scroll(strip, advance(strip.scroll));
             }
+            self.shown_display = display;
         }
         self.animating = true;
+        self.needs_apply = true;
+        self.gesture_until = Some(Instant::now() + Duration::from_millis(140));
         self.reveal_indicator();
+        self.apply();
+    }
+
+    fn gesture_active(&self) -> bool {
+        self.gesture_until.is_some_and(|until| Instant::now() < until)
+    }
+
+    pub fn flush(&mut self) {
+        if self.needs_apply && !self.animating {
+            self.apply();
+        }
+    }
+
+    pub fn reveal_activated(&mut self, pid: i32) {
+        if !self.settings.tiling_enabled || pid <= 0 || pid == std::process::id() as i32 {
+            return;
+        }
+        ax::deminiaturize(pid);
+        if self.window_for_app(pid).is_none() {
+            self.reconcile();
+        }
+        let Some(id) = self.window_for_app(pid) else {
+            return;
+        };
+        self.focus_window(id, false);
+        if let Some(column_id) = self.column_id_of(id) {
+            self.align_column(column_id);
+        }
+        self.animating = false;
+        self.apply();
+    }
+
+    fn window_for_app(&self, pid: i32) -> Option<WindowId> {
+        if self.focused.is_some_and(|id| id.pid == pid && self.live_contains(id)) {
+            return self.focused;
+        }
+        if self.settings.desk_mode == DeskMode::Unified {
+            return self
+                .unified
+                .columns
+                .iter()
+                .flat_map(|column| column.windows.iter().copied())
+                .find(|id| id.pid == pid);
+        }
+        for display in &self.displays {
+            let Some(strip) = self.strips.get(&display.id) else {
+                continue;
+            };
+            if let Some(id) = strip
+                .columns
+                .iter()
+                .flat_map(|column| column.windows.iter().copied())
+                .find(|id| id.pid == pid)
+            {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    fn align_column(&mut self, column_id: u64) {
+        if self.settings.desk_mode == DeskMode::Unified {
+            let (viewport, content, origin, _) = self.unified_column_metrics(column_id);
+            follow_scroll(&mut self.unified, clamp_scroll(origin, viewport, content));
+            return;
+        }
+        let Some(display) = self.column_display(column_id) else {
+            return;
+        };
+        let (viewport, content, origin, _) = self.display_column_metrics(display, column_id);
+        let next = clamp_scroll(origin, viewport, content);
+        if let Some(strip) = self.strips.get_mut(&display) {
+            follow_scroll(strip, next);
+        }
+        self.shown_display = display;
     }
 
     fn reveal_focused(&mut self, force_center: bool) {
@@ -1130,6 +1516,7 @@ impl Session {
         let next = presets.iter().copied().find(|preset| *preset > current + 0.02).unwrap_or(presets.first().copied().unwrap_or(0.5));
         if let Some(column) = self.column_by_id_mut(column_id) {
             column.width_ratio = next;
+            column.arrange_lock = false;
         }
         self.clear_rigid(column_id);
         self.finish_setting();
@@ -1142,10 +1529,218 @@ impl Session {
         };
         if let Some(column) = self.column_by_id_mut(column_id) {
             column.width_ratio = 1.0;
+            column.height_fill = 1.0;
+            column.vertical = VerticalAlign::Top;
+            column.arrange_lock = false;
+            column.pin = None;
         }
         self.clear_rigid(column_id);
         self.finish_setting();
         self.reveal_focused(true);
+    }
+
+    pub fn arrange(&mut self, kind: Arrange) {
+        if !self.settings.tiling_enabled {
+            self.set_tiling(true);
+            if !self.settings.tiling_enabled {
+                return;
+            }
+        }
+        if let Some(pane) = kind.pane() {
+            if !self.place_focused_pane(pane) {
+                return;
+            }
+        } else if let Some(stacks) = kind.stacks() {
+            if !self.fill_screen(stacks) {
+                return;
+            }
+        }
+        self.snapshot.status = format!("Arranged {}", kind.title());
+        self.dirty_ui = true;
+        self.reveal_indicator();
+    }
+
+    fn place_focused_pane(&mut self, pane: Pane) -> bool {
+        let Some(column_id) = self.isolate_focused() else {
+            self.snapshot.status = "Focus a window first.".into();
+            self.dirty_ui = true;
+            return false;
+        };
+        if let Some(edge) = pane.pin {
+            self.for_each_column_mut(|column| {
+                if column.pin == Some(edge) {
+                    column.pin = None;
+                }
+            });
+        }
+        if let Some(column) = self.column_by_id_mut(column_id) {
+            column.width_ratio = pane.fraction.clamp(0.15, 1.0);
+            column.height_fill = pane.height.clamp(0.2, 1.0);
+            column.vertical = pane.vertical;
+            column.pin = pane.pin;
+            column.arrange_lock = true;
+            column.mode = ColumnMode::Stacked;
+        }
+        self.clear_rigid(column_id);
+        if pane.pin.is_none() {
+            self.move_column_first(column_id);
+        }
+        let viewport = self.column_viewport(column_id);
+        let scroll = if pane.center {
+            let width = pane.fraction.clamp(0.15, 1.0) * viewport;
+            -((viewport - width) / 2.0)
+        } else if pane.pin.is_none() {
+            0.0
+        } else {
+            self.column_scroll(column_id)
+        };
+        self.set_column_scroll(column_id, scroll);
+        self.finish_setting();
+        self.apply();
+        true
+    }
+
+    fn fill_screen(&mut self, stacks: &[openlayout::engine::Stack]) -> bool {
+        let windows = self.screen_windows();
+        if windows.is_empty() {
+            self.snapshot.status = "No windows on this screen.".into();
+            self.dirty_ui = true;
+            return false;
+        }
+        let (groups, extra) = take_groups(stacks, &windows);
+        let viewport = self.screen_viewport();
+        let shares: Vec<f64> = groups.iter().map(|(stack, _)| stack.share).collect();
+        let widths = ratios(&shares, self.settings.gap, viewport);
+        let mut columns = Vec::new();
+        for ((stack, ids), ratio) in groups.into_iter().zip(widths) {
+            let mut column = self.make_column(ids, ratio);
+            column.arrange_lock = true;
+            column.height_fill = 1.0;
+            column.vertical = VerticalAlign::Top;
+            if !stack.weights.is_empty() {
+                column.height_weights = stack.weights.to_vec();
+            }
+            columns.push(column);
+        }
+        for id in extra {
+            columns.push(self.make_column(vec![id], self.settings.default_width));
+        }
+        self.replace_screen_columns(columns);
+        self.finish_setting();
+        self.apply();
+        true
+    }
+
+    fn isolate_focused(&mut self) -> Option<u64> {
+        let focused = self.focused?;
+        let column_id = self.column_id_of(focused)?;
+        let len = self.column_by_id(column_id).map(|column| column.windows.len()).unwrap_or(0);
+        if len <= 1 {
+            return Some(column_id);
+        }
+        self.take_window_from_column(column_id, focused);
+        let column = self.make_column(vec![focused], self.settings.default_width);
+        let id = column.id;
+        if self.column_by_id(column_id).is_some() {
+            self.insert_column_near(column_id, column, 1);
+        } else {
+            self.insert_column_first(column);
+        }
+        Some(id)
+    }
+
+    fn screen_windows(&self) -> Vec<WindowId> {
+        let mut ids = Vec::new();
+        for column in self.screen_columns() {
+            ids.extend(column.windows.iter().copied().filter(|id| !self.floating.contains(id)));
+        }
+        if let Some(focused) = self.focused {
+            if let Some(index) = ids.iter().position(|id| *id == focused) {
+                let id = ids.remove(index);
+                ids.insert(0, id);
+            }
+        }
+        ids
+    }
+
+    fn screen_columns(&self) -> Vec<Column> {
+        if self.settings.desk_mode == DeskMode::Unified {
+            return self.unified.columns.clone();
+        }
+        let display = self.focused_display().or_else(|| self.displays.first().map(|display| display.id));
+        display.and_then(|id| self.strips.get(&id).map(|strip| strip.columns.clone())).unwrap_or_default()
+    }
+
+    fn screen_viewport(&self) -> f64 {
+        if self.settings.desk_mode == DeskMode::Unified {
+            return self.displays.iter().map(|display| display.usable.width).sum::<f64>().max(320.0);
+        }
+        let display = self.focused_display().or_else(|| self.displays.first().map(|display| display.id));
+        self.displays.iter().find(|item| Some(item.id) == display).map(|item| item.usable.width).unwrap_or(1400.0)
+    }
+
+    fn replace_screen_columns(&mut self, columns: Vec<Column>) {
+        if self.settings.desk_mode == DeskMode::Unified {
+            self.unified.columns = columns;
+            follow_scroll(&mut self.unified, 0.0);
+            return;
+        }
+        let display = self.focused_display().or_else(|| self.displays.first().map(|display| display.id));
+        if let Some(display) = display {
+            let strip = self.strips.entry(display).or_default();
+            strip.columns = columns;
+            follow_scroll(strip, 0.0);
+        }
+    }
+
+    fn move_column_first(&mut self, id: u64) {
+        let display = self.column_display(id);
+        let Some(column) = self.take_column(id) else {
+            return;
+        };
+        self.insert_column_first_on(display, column);
+    }
+
+    fn insert_column_first(&mut self, column: Column) {
+        let display = self.focused_display().or_else(|| self.displays.first().map(|display| display.id));
+        self.insert_column_first_on(display, column);
+    }
+
+    fn insert_column_first_on(&mut self, display: Option<u32>, column: Column) {
+        if self.settings.desk_mode == DeskMode::Unified {
+            self.unified.columns.insert(0, column);
+            return;
+        }
+        if let Some(display) = display {
+            self.strips.entry(display).or_default().columns.insert(0, column);
+        }
+    }
+
+    fn column_viewport(&self, column_id: u64) -> f64 {
+        if self.settings.desk_mode == DeskMode::Unified {
+            return self.screen_viewport();
+        }
+        let display = self.column_display(column_id);
+        self.displays.iter().find(|item| Some(item.id) == display).map(|item| item.usable.width).unwrap_or(1400.0)
+    }
+
+    fn column_scroll(&self, column_id: u64) -> f64 {
+        if self.settings.desk_mode == DeskMode::Unified {
+            return self.unified.scroll;
+        }
+        self.column_display(column_id).and_then(|id| self.strips.get(&id).map(|strip| strip.scroll)).unwrap_or(0.0)
+    }
+
+    fn set_column_scroll(&mut self, column_id: u64, scroll: f64) {
+        if self.settings.desk_mode == DeskMode::Unified {
+            follow_scroll(&mut self.unified, scroll);
+            return;
+        }
+        if let Some(display) = self.column_display(column_id) {
+            if let Some(strip) = self.strips.get_mut(&display) {
+                follow_scroll(strip, scroll);
+            }
+        }
     }
 
     fn nudge_width(&mut self, delta: f64) {
@@ -1154,6 +1749,7 @@ impl Session {
         };
         if let Some(column) = self.column_by_id_mut(column_id) {
             column.width_ratio = (column.width_ratio + delta).clamp(0.15, 1.0);
+            column.arrange_lock = false;
         }
         self.clear_rigid(column_id);
         self.finish_setting();
@@ -1413,14 +2009,13 @@ impl Session {
     }
 
     fn reveal_indicator(&mut self) {
-        self.indicator_until = Some(Instant::now() + Duration::from_millis(1400));
+        self.indicator_until = Some(Instant::now() + Duration::from_millis(700));
         self.snapshot.indicator_visible = true;
         self.dirty_ui = true;
     }
 
     fn publish_snapshot(&mut self) {
         let mut columns = Vec::new();
-        let mut indicator = Vec::new();
         for column_id in self.visual_ids() {
             let Some(column) = self.column_by_id(column_id) else {
                 continue;
@@ -1438,7 +2033,6 @@ impl Session {
                 .and_then(|id| self.windows.get(id).map(|window| window.app_name.clone()))
                 .unwrap_or_default();
             let focused = column.windows.iter().any(|id| self.focused == Some(*id));
-            indicator.push(IndicatorTile { column_id, title: title.clone(), focused });
             if let Some(frame) = self.column_frames.get(&column_id).copied() {
                 columns.push(SnapshotColumn {
                     id: column_id,
@@ -1453,31 +2047,115 @@ impl Session {
             }
         }
         let focus_frame = self.focused.and_then(|id| self.placements.get(&id)).filter(|placement| !placement.parked).map(|placement| placement.frame);
-        let visible = self.modifier_held || self.indicator_until.is_some_and(|until| Instant::now() < until);
         self.snapshot.displays = self.displays.clone();
         self.snapshot.columns = columns;
         self.snapshot.focus_frame = focus_frame;
-        self.snapshot.indicator = indicator;
-        self.snapshot.indicator_visible = visible && self.settings.tiling_enabled;
         self.snapshot.tiling = self.settings.tiling_enabled;
         self.snapshot.trusted = self.trusted;
+        self.snapshot.input_monitoring = self.input_monitoring;
         self.snapshot.window_count = self.windows.len();
         self.refresh_status();
+        self.refresh_indicator();
+    }
+
+    fn refresh_indicator(&mut self) {
+        let (display, tiles) = self.indicator_tiles();
+        let visible = self.settings.tiling_enabled
+            && !tiles.is_empty()
+            && (self.animating || self.gesture_active() || self.indicator_until.is_some_and(|until| Instant::now() < until));
+        self.snapshot.indicator = tiles;
+        self.snapshot.indicator_visible = visible;
+        self.snapshot.indicator_display = display;
+    }
+
+    fn indicator_tiles(&self) -> (u32, Vec<IndicatorTile>) {
+        let (display, columns, scroll, usable) = self.indicator_source();
+        let states: Vec<ColumnState> = columns.iter().map(|column| self.column_state(column, usable)).collect();
+        let measured = if self.settings.desk_mode == DeskMode::Unified {
+            unified_metrics(&self.displays, &states, self.settings.gap)
+        } else {
+            metrics(&states, self.settings.gap, usable)
+        };
+        let mut ordered = Vec::new();
+        ordered.extend(columns.iter().filter(|column| column.pin == Some(PinEdge::Left)));
+        ordered.extend(columns.iter().filter(|column| column.pin.is_none()));
+        ordered.extend(columns.iter().filter(|column| column.pin == Some(PinEdge::Right)));
+        let tiles = ordered
+            .into_iter()
+            .map(|column| {
+                let width = states.iter().find(|state| state.id == column.id).map(|state| state.width).unwrap_or(0.0);
+                let on_screen = measured.origins.get(&column.id).copied().is_none_or(|origin| {
+                    origin < scroll + measured.viewport_width && origin + width > scroll
+                });
+                let title = column
+                    .windows
+                    .iter()
+                    .find_map(|id| self.windows.get(id).map(|window| window.title.clone()))
+                    .filter(|title| !title.is_empty())
+                    .or_else(|| column.windows.iter().find_map(|id| self.windows.get(id).map(|window| window.app_name.clone())))
+                    .unwrap_or_else(|| "Window".into());
+                let focused = column.windows.iter().any(|id| self.focused == Some(*id));
+                IndicatorTile { column_id: column.id, title, focused, on_screen }
+            })
+            .collect();
+        (display, tiles)
+    }
+
+    fn indicator_source(&self) -> (u32, Vec<Column>, f64, f64) {
+        let display = self.shown_display_or_focused();
+        if self.settings.desk_mode == DeskMode::Unified {
+            let unit = self.displays.first().map(|item| item.usable.width).unwrap_or(1400.0);
+            return (display, self.unified.columns.clone(), self.unified.scroll, unit);
+        }
+        let scroll = self.strips.get(&display).map(|strip| strip.scroll).unwrap_or(0.0);
+        let columns = self.strips.get(&display).map(|strip| strip.columns.clone()).unwrap_or_default();
+        let usable = self.displays.iter().find(|item| item.id == display).map(|item| item.usable.width).unwrap_or(1400.0);
+        (display, columns, scroll, usable)
+    }
+
+    fn shown_display_or_focused(&self) -> u32 {
+        if self.shown_display != 0
+            && (self.settings.desk_mode == DeskMode::Unified || self.strips.contains_key(&self.shown_display))
+        {
+            return self.shown_display;
+        }
+        self.focused_display()
+            .or_else(|| self.displays.first().map(|display| display.id))
+            .unwrap_or(0)
+    }
+
+    fn raise_front_tabs(&self) {
+        let columns: Vec<Column> = if self.settings.desk_mode == DeskMode::Unified {
+            self.unified.columns.clone()
+        } else {
+            self.strips.values().flat_map(|strip| strip.columns.iter().cloned()).collect()
+        };
+        for column in columns {
+            if column.mode != ColumnMode::Tabbed || column.windows.len() < 2 {
+                continue;
+            }
+            let index = column.active_index.min(column.windows.len() - 1);
+            let Some(id) = column.windows.get(index).copied() else {
+                continue;
+            };
+            if let Some(window) = self.windows.get(&id) {
+                ax::raise(window.element);
+            }
+        }
     }
 
     fn refresh_status(&mut self) {
         self.snapshot.status = if !self.trusted {
-            "Accessibility permission required".into()
+            "Accessibility is off.".into()
+        } else if !self.input_monitoring {
+            "Accessibility is on. Input Monitoring is off, so scrolling stays blocked.".into()
         } else if !self.settings.tiling_enabled {
-            format!("{} displays connected. Tiling is paused.", self.displays.len().max(screens::screens().len()))
+            format!("Accessibility is on. {} displays connected. Tiling is paused.", self.displays.len().max(screens::screens().len()))
         } else {
-            format!(
-                "Managing {} windows across {} displays",
-                self.snapshot.window_count,
-                self.displays.len()
-            )
+            format!("Managing {} windows across {} displays.", self.snapshot.window_count, self.displays.len())
         };
         self.snapshot.trusted = self.trusted;
+        self.snapshot.input_monitoring = self.input_monitoring;
         self.snapshot.tiling = self.settings.tiling_enabled;
         self.dirty_ui = true;
     }
@@ -1540,6 +2218,16 @@ impl Session {
                 })
                 .collect(),
             unified: self.unified.columns.iter().map(|column| self.save_column(column)).collect(),
+            offline: self
+                .parked_screens
+                .iter()
+                .map(|(id, strip)| SavedDisplay {
+                    display_id: *id,
+                    index: usize::MAX,
+                    columns: strip.columns.iter().map(|column| self.save_column(column)).collect(),
+                    scroll: strip.scroll,
+                })
+                .collect(),
         }
     }
 
@@ -1552,6 +2240,8 @@ impl Session {
             mode: Some(column.mode),
             pin: column.pin,
             height_fill: column.height_fill,
+            vertical: column.vertical,
+            arrange_lock: column.arrange_lock,
         }
     }
 
@@ -1568,6 +2258,26 @@ impl Session {
         ids.extend(columns.iter().filter(|column| column.pin.is_none()).map(|column| column.id));
         ids.extend(columns.iter().filter(|column| column.pin == Some(PinEdge::Right)).map(|column| column.id));
         ids
+    }
+
+    fn scroll_display(&self, x: f64, y: f64) -> Option<u32> {
+        self.display_under_pointer(x, y)
+            .filter(|id| self.strips.get(id).is_some_and(|strip| !strip.columns.is_empty()))
+            .or_else(|| self.focused_display().filter(|id| self.strips.get(id).is_some_and(|strip| !strip.columns.is_empty())))
+            .or_else(|| {
+                self.displays
+                    .iter()
+                    .find(|display| self.strips.get(&display.id).is_some_and(|strip| !strip.columns.is_empty()))
+                    .map(|display| display.id)
+            })
+    }
+
+    fn display_under_pointer(&self, cg_x: f64, cg_y: f64) -> Option<u32> {
+        if !cg_x.is_finite() || !cg_y.is_finite() || self.primary_height <= 0.0 {
+            return None;
+        }
+        let y = self.primary_height - cg_y;
+        self.displays.iter().find(|display| display.frame.contains(cg_x, y)).map(|display| display.id)
     }
 
     fn focused_display(&self) -> Option<u32> {
@@ -1686,6 +2396,8 @@ impl Session {
             pin: None,
             active_index: 0,
             height_fill: 1.0,
+            vertical: VerticalAlign::Top,
+            arrange_lock: false,
         }
     }
 
@@ -1761,6 +2473,7 @@ fn live_from_raw(window: RawWindow, keep: bool) -> LiveWindow {
         natural_height: window.frame.height,
         rigid_width: None,
         checked_size: false,
+        space: 0,
     }
 }
 
@@ -1785,15 +2498,39 @@ fn sanitize_strip(strip: &mut Strip) {
     }
 }
 
+fn tidy_ratio(ratio: f64, presets: &[f64]) -> f64 {
+    if ratio >= 0.9 {
+        return 1.0;
+    }
+    let Some(nearest) = presets.iter().copied().min_by(|left, right| {
+        (left - ratio).abs().partial_cmp(&(right - ratio).abs()).unwrap_or(std::cmp::Ordering::Equal)
+    }) else {
+        return ratio;
+    };
+    if (nearest - ratio).abs() <= 0.08 { nearest } else { ratio }
+}
+
+fn pull_window(strip: &mut Strip, id: WindowId) {
+    for column in &mut strip.columns {
+        column.windows.retain(|window| *window != id);
+    }
+    strip.columns.retain(|column| !column.windows.is_empty());
+}
+
+fn follow_scroll(strip: &mut Strip, next: f64) {
+    strip.scroll = next;
+    strip.scroll_target = next;
+}
+
 fn step_value(value: &mut f64, target: f64) -> bool {
     let delta = target - *value;
-    if delta.abs() < 0.6 {
+    if delta.abs() < 0.5 {
         *value = target;
-        false
-    } else {
-        *value += delta * 0.35;
-        true
+        return false;
     }
+    // 120Hz timer: close about 80% of the gap every 16ms, so a focus change slides and settles.
+    *value += delta * 0.55;
+    true
 }
 
 fn near(left: Rect, right: Rect) -> bool {
